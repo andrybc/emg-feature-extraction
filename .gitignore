@@ -1,0 +1,29 @@
+# Python environment
+.venv/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Jupyter notebooks and notebook checkpoints
+notebooks/
+.ipynb_checkpoints/
+
+# Personal learning notes
+notes/
+
+# Data files
+data/
+*.csv
+*.npy
+*.npz
+*.pkl
+*.h5
+*.mat
+
+# OS/editor files
+.DS_Store
+.vscode/
+.idea/
