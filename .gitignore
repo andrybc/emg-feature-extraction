@@ -1,29 +1,41 @@
-# Python environment
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
 .venv/
 venv/
 env/
-
-# Python cache
-__pycache__/
-*.py[cod]
-
-# Jupyter notebooks and notebook checkpoints
-notebooks/
+.env
+data/raw/
+data/processed/
+data/simulated/
+**/*.csv
+**/*.npy
+**/*.npz
+**/*.pkl
+**/*.pickle
+**/*.edf
+**/*.bdf
+**/*_info.txt
+emg_tmp_*
 .ipynb_checkpoints/
-
-# Personal learning notes
-notes/
-
-# Data files
-data/
-*.csv
-*.npy
-*.npz
-*.pkl
-*.h5
-*.mat
-
-# OS/editor files
-.DS_Store
+**/.ipynb_checkpoints/
+build/
+dist/
+*.spec
+**/*.png
+**/*.jpg
+**/*.jpeg
+**/*.svg
 .vscode/
 .idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+*.log
+*.tmp
+*.bak
+.pytest_cache/
+.coverage
