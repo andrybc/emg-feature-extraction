@@ -455,6 +455,18 @@ class EMGSimulatorApp:
         self.theme_name      = 'dark'
         self.theme           = THEMES['dark']
 
+        # Channel order: channel_order[display_pos] = actual channel index
+        # e.g. [0,1,2,3,4,5,6,7] = default, [2,0,1,...] = CH3 moved to top
+        self.channel_order   = list(range(N_CHANNELS))
+
+        # channel_enabled[ch_idx] = True means that channel is shown
+        self.channel_enabled = [True] * N_CHANNELS
+
+        # Drag and drop state
+        self._drag_src_pos  = None   # position being dragged from
+        self._drag_tgt_pos  = None   # position being hovered over
+        self._drag_ghost_wn = None   # the floating ghost Toplevel window
+
         # ---- Display buffer ----
         # Each channel gets a deque of length DISPLAY_SAMPLES.
         # A deque with maxlen automatically drops the oldest value when
@@ -538,10 +550,19 @@ class EMGSimulatorApp:
         self.gesture_label.pack(side='right', padx=20)
 
         # ============================================================
-        # 2. OSCILLOSCOPE PLOT
+        # 2. OSCILLOSCOPE PLOT + CHANNEL PANEL (horizontal container)
         # ============================================================
-        plot_frame = tk.Frame(self.root, bg='#07101f')
-        plot_frame.pack(fill='both', expand=True, padx=14, pady=4)
+        plot_container = tk.Frame(self.root, bg=self.theme['bg_primary'])
+        plot_container.pack(fill='both', expand=True, padx=14, pady=4)
+
+        # Channel panel goes on the RIGHT -- must be packed before plot_frame
+        # because pack() assigns space in the order widgets are packed
+        # If we packed plot_frame first with expand=True it would take everything
+        self._build_channel_panel(plot_container)
+
+        # Plot frame fills the remaining left space
+        plot_frame = tk.Frame(plot_container, bg=self.theme['bg_plot'])
+        plot_frame.pack(side='left', fill='both', expand=True)
 
         # Create a matplotlib figure with 8 subplots sharing the x axis
         # sharex=True: zooming or panning one plot affects all others
@@ -763,6 +784,429 @@ class EMGSimulatorApp:
         )
         self.elapsed_lbl.pack(side='right', padx=10)
 
+
+
+    def _build_channel_panel(self, parent):
+        """
+        Build the right-side channel management panel.
+        Contains one draggable row per channel with an ON/OFF toggle.
+        """
+        t = self.theme
+
+        # Outer panel -- fixed width, full height
+        self._ch_panel = tk.Frame(
+            parent,
+            bg=t['bg_primary'],
+            width=148
+        )
+        self._ch_panel.pack(side='right', fill='y', padx=(6, 0))
+        self._ch_panel.pack_propagate(False)  # Prevent children from resizing it
+
+        # Title
+        tk.Label(
+            self._ch_panel,
+            text="Channels",
+            bg=t['bg_primary'],
+            fg=t['fg_accent'],
+            font=('Helvetica', 9, 'bold')
+        ).pack(pady=(10, 3))
+
+        # Thin separator line
+        tk.Frame(
+            self._ch_panel,
+            bg=t['fg_dim'],
+            height=1
+        ).pack(fill='x', padx=8, pady=(0, 6))
+
+        # Inner scrollable frame for rows
+        self._ch_rows_frame = tk.Frame(self._ch_panel, bg=t['bg_primary'])
+        self._ch_rows_frame.pack(fill='both', expand=True, padx=6)
+
+        # Storage for row frame references (rebuilt on each reorder)
+        self._ch_row_frames = []
+        self._rebuild_channel_rows()
+
+        # Thin separator line above reset button
+        tk.Frame(
+            self._ch_panel,
+            bg=t['fg_dim'],
+            height=1
+        ).pack(fill='x', padx=8, pady=(6, 4))
+
+        # Reset button
+        self._reset_btn = tk.Button(
+            self._ch_panel,
+            text="Reset Order",
+            command=self._reset_channel_order,
+            bg=t['btn_bg'],
+            fg=t['fg_secondary'],
+            activebackground=t['btn_active_bg'],
+            activeforeground=t['fg_primary'],
+            relief='flat',
+            font=('Helvetica', 8),
+            cursor='hand2',
+            pady=5
+        )
+        self._reset_btn.pack(fill='x', padx=8, pady=(0, 10))
+
+
+    def _rebuild_channel_rows(self):
+            """
+            Destroy all existing channel rows and recreate them
+            in the current channel_order. Called after every reorder or toggle.
+            """
+            t = self.theme
+
+            # Destroy existing rows cleanly
+            for frame in self._ch_row_frames:
+                frame.destroy()
+            self._ch_row_frames = []
+
+            for display_pos in range(N_CHANNELS):
+                ch_idx  = self.channel_order[display_pos]
+                color   = CHANNEL_COLORS[ch_idx]
+                enabled = self.channel_enabled[ch_idx]
+
+                # Row background -- slightly different from panel bg
+                row_bg = t['bg_secondary']
+
+                row = tk.Frame(
+                    self._ch_rows_frame,
+                    bg=row_bg,
+                    relief='flat',
+                    padx=3,
+                    pady=4
+                )
+                row.pack(fill='x', pady=2)
+
+                # Drag handle -- cursor changes to crosshair to signal draggability
+                handle = tk.Label(
+                    row,
+                    text="⠿",
+                    bg=row_bg,
+                    fg=t['fg_dim'],
+                    font=('Helvetica', 12),
+                    cursor='fleur'
+                )
+                handle.pack(side='left', padx=(2, 3))
+
+                # Colored dot showing channel identity
+                dot = tk.Label(
+                    row,
+                    text="●",
+                    bg=row_bg,
+                    fg=color if enabled else t['fg_dim'],
+                    font=('Helvetica', 10)
+                )
+                dot.pack(side='left', padx=(0, 3))
+
+                # Channel label
+                ch_lbl = tk.Label(
+                    row,
+                    text=f"CH{ch_idx + 1}",
+                    bg=row_bg,
+                    fg=color if enabled else t['fg_dim'],
+                    font=('Courier', 9, 'bold'),
+                    width=4,
+                    anchor='w'
+                )
+                ch_lbl.pack(side='left')
+
+                # ON / OFF toggle button
+                en_btn = tk.Button(
+                    row,
+                    text="ON" if enabled else "OFF",
+                    command=lambda ci=ch_idx: self._toggle_channel_enabled(ci),
+                    bg='#1a3a2a' if enabled else '#3a1a1a',
+                    fg='#34d399' if enabled else '#f87171',
+                    activebackground=t['btn_active_bg'],
+                    relief='flat',
+                    font=('Courier', 7, 'bold'),
+                    width=3,
+                    cursor='hand2',
+                    pady=2
+                )
+                en_btn.pack(side='right', padx=(2, 2))
+
+                # Bind drag events to every widget in the row EXCEPT the toggle button
+                # The toggle button handles its own click event
+                for widget in [row, handle, dot, ch_lbl]:
+                    widget.bind(
+                        '<Button-1>',
+                        lambda e, p=display_pos: self._drag_start(e, p)
+                    )
+                    widget.bind('<B1-Motion>',       self._drag_motion)
+                    widget.bind('<ButtonRelease-1>', self._drag_release)
+
+                self._ch_row_frames.append(row)
+
+
+    def _rebuild_channel_rows(self):
+        """
+        Destroy all existing channel rows and recreate them
+        in the current channel_order. Called after every reorder or toggle.
+        """
+        t = self.theme
+
+        # Destroy existing rows cleanly
+        for frame in self._ch_row_frames:
+            frame.destroy()
+        self._ch_row_frames = []
+
+        for display_pos in range(N_CHANNELS):
+            ch_idx  = self.channel_order[display_pos]
+            color   = CHANNEL_COLORS[ch_idx]
+            enabled = self.channel_enabled[ch_idx]
+
+            # Row background -- slightly different from panel bg
+            row_bg = t['bg_secondary']
+
+            row = tk.Frame(
+                self._ch_rows_frame,
+                bg=row_bg,
+                relief='flat',
+                padx=3,
+                pady=4
+            )
+            row.pack(fill='x', pady=2)
+
+            # Drag handle -- cursor changes to crosshair to signal draggability
+            handle = tk.Label(
+                row,
+                text="⠿",
+                bg=row_bg,
+                fg=t['fg_dim'],
+                font=('Helvetica', 12),
+                cursor='fleur'
+            )
+            handle.pack(side='left', padx=(2, 3))
+
+            # Colored dot showing channel identity
+            dot = tk.Label(
+                row,
+                text="●",
+                bg=row_bg,
+                fg=color if enabled else t['fg_dim'],
+                font=('Helvetica', 10)
+            )
+            dot.pack(side='left', padx=(0, 3))
+
+            # Channel label
+            ch_lbl = tk.Label(
+                row,
+                text=f"CH{ch_idx + 1}",
+                bg=row_bg,
+                fg=color if enabled else t['fg_dim'],
+                font=('Courier', 9, 'bold'),
+                width=4,
+                anchor='w'
+            )
+            ch_lbl.pack(side='left')
+
+            # ON / OFF toggle button
+            en_btn = tk.Button(
+                row,
+                text="ON" if enabled else "OFF",
+                command=lambda ci=ch_idx: self._toggle_channel_enabled(ci),
+                bg='#1a3a2a' if enabled else '#3a1a1a',
+                fg='#34d399' if enabled else '#f87171',
+                activebackground=t['btn_active_bg'],
+                relief='flat',
+                font=('Courier', 7, 'bold'),
+                width=3,
+                cursor='hand2',
+                pady=2
+            )
+            en_btn.pack(side='right', padx=(2, 2))
+
+            # Bind drag events to every widget in the row EXCEPT the toggle button
+            # The toggle button handles its own click event
+            for widget in [row, handle, dot, ch_lbl]:
+                widget.bind(
+                    '<Button-1>',
+                    lambda e, p=display_pos: self._drag_start(e, p)
+                )
+                widget.bind('<B1-Motion>',       self._drag_motion)
+                widget.bind('<ButtonRelease-1>', self._drag_release)
+
+            self._ch_row_frames.append(row)
+    
+
+
+    def _drag_start(self, event, position):
+        """
+        User pressed mouse button on a channel row.
+        Record the source position and spawn a ghost window.
+        """
+        self._drag_src_pos = position
+        self._drag_tgt_pos = position
+
+        ch_idx = self.channel_order[position]
+        color  = CHANNEL_COLORS[ch_idx]
+
+        # Create a small floating window that follows the cursor during drag
+        # overrideredirect(True): removes all window decorations (no title bar)
+        # topmost(True): always renders above other windows
+        self._drag_ghost_wn = tk.Toplevel(self.root)
+        self._drag_ghost_wn.overrideredirect(True)
+        self._drag_ghost_wn.attributes('-alpha', 0.82)
+        self._drag_ghost_wn.attributes('-topmost', True)
+
+        tk.Label(
+            self._drag_ghost_wn,
+            text=f"  CH{ch_idx + 1}  ",
+            bg=color,
+            fg='#0f172a',
+            font=('Courier', 10, 'bold'),
+            padx=8,
+            pady=5
+        ).pack()
+
+        # Position ghost slightly offset from the cursor so it does not
+        # block the widget underneath and interfere with motion events
+        self._drag_ghost_wn.geometry(
+            f"+{event.x_root + 14}+{event.y_root + 6}"
+        )
+
+    def _drag_motion(self, event):
+        """
+        User is moving the mouse while holding the button.
+        Move the ghost window and highlight the current drop target.
+        """
+        if self._drag_ghost_wn is None:
+            return
+
+        # Move ghost with cursor
+        self._drag_ghost_wn.geometry(
+            f"+{event.x_root + 14}+{event.y_root + 6}"
+        )
+
+        # Figure out which row the cursor is over
+        new_tgt = self._get_drop_position(event.y_root)
+
+        if new_tgt != self._drag_tgt_pos:
+            # Remove highlight from old target row
+            self._set_row_highlight(self._drag_tgt_pos, highlighted=False)
+
+            # Apply highlight to new target row
+            self._drag_tgt_pos = new_tgt
+            self._set_row_highlight(self._drag_tgt_pos, highlighted=True)
+
+    def _drag_release(self, event):
+        """
+        User released the mouse button.
+        Perform the reorder if src != tgt, then clean up.
+        """
+        # Destroy ghost window
+        if self._drag_ghost_wn is not None:
+            self._drag_ghost_wn.destroy()
+            self._drag_ghost_wn = None
+
+        src = self._drag_src_pos
+        tgt = self._get_drop_position(event.y_root)
+
+        if src is not None and tgt is not None and src != tgt:
+            # Remove the channel from its old position and insert at new position
+            # list.pop(i) removes and returns element at index i
+            # list.insert(i, val) inserts val before index i
+            ch = self.channel_order.pop(src)
+            self.channel_order.insert(tgt, ch)
+
+            self._refresh_plot_labels()
+
+        # Always rebuild rows to clear any highlight state
+        self._rebuild_channel_rows()
+
+        self._drag_src_pos = None
+        self._drag_tgt_pos = None
+
+    def _get_drop_position(self, y_root):
+        """
+        Given the mouse y position in screen coordinates,
+        return which row index the cursor is closest to.
+
+        We compare against the midpoint of each row so the
+        channel snaps to a new position when you cross the halfway point.
+        """
+        if not self._ch_row_frames:
+            return 0
+
+        for i, row in enumerate(self._ch_row_frames):
+            row_top = row.winfo_rooty()
+            row_mid = row_top + row.winfo_height() // 2
+
+            if y_root <= row_mid:
+                return i
+
+        # Mouse is below all rows -- snap to last position
+        return len(self._ch_row_frames) - 1
+
+    def _set_row_highlight(self, position, highlighted: bool):
+        """
+        Apply or remove a highlight color on a row and its children.
+        Used to give visual feedback during drag.
+        """
+        if position is None or position >= len(self._ch_row_frames):
+            return
+
+        row = self._ch_row_frames[position]
+        bg  = self.theme['btn_active_bg'] if highlighted else self.theme['bg_secondary']
+
+        row.configure(bg=bg)
+        for child in row.winfo_children():
+            # Skip the ON/OFF button -- it has its own color logic
+            if isinstance(child, tk.Button):
+                continue
+            try:
+                child.configure(bg=bg)
+            except tk.TclError:
+                pass
+    
+
+
+
+    def _toggle_channel_enabled(self, ch_idx: int):
+        """Toggle a single channel on or off and refresh the panel."""
+        self.channel_enabled[ch_idx] = not self.channel_enabled[ch_idx]
+        self._rebuild_channel_rows()
+
+    def _reset_channel_order(self):
+        """Reset to original channel order and re-enable all channels."""
+        self.channel_order   = list(range(N_CHANNELS))
+        self.channel_enabled = [True] * N_CHANNELS
+        self._rebuild_channel_rows()
+        self._refresh_plot_labels()
+
+    def _refresh_plot_labels(self):
+        """
+        Update the y-axis label and line color on each subplot
+        to reflect the current channel_order.
+
+        Called after every reorder so the plot always accurately
+        describes what is being displayed.
+        """
+        for display_pos in range(N_CHANNELS):
+            ch_idx = self.channel_order[display_pos]
+            color  = CHANNEL_COLORS[ch_idx]
+
+            self.axes[display_pos].set_ylabel(
+                f'CH{ch_idx + 1}',
+                color=color,
+                fontsize=8, fontweight='bold',
+                fontfamily='monospace',
+                rotation=0, labelpad=26
+            )
+            self.axes[display_pos].yaxis.set_label_coords(-0.042, 0.35)
+
+            # Update the line color to match the channel now in this slot
+            self.lines[display_pos].set_color(color)
+
+        self.mpl_canvas.draw_idle()
+
+
+
+
+
     # ------------------------------------------------------------------
     # GESTURE ACTIVATION
     # ------------------------------------------------------------------
@@ -931,6 +1375,21 @@ class EMGSimulatorApp:
         # Clear the blit background cache so the animation picks up new colors
         # Without this, FuncAnimation keeps restoring the old cached background
         # on every frame, overwriting the theme change until a resize forces a reset
+
+        
+        # Rebuild channel rows so ON/OFF buttons and labels use new theme colors
+        if hasattr(self, '_ch_rows_frame'):
+            self._rebuild_channel_rows()
+
+        # Restyle the channel panel frame and reset button
+        if hasattr(self, '_ch_panel'):
+            self._ch_panel.configure(bg=t['bg_primary'])
+        if hasattr(self, '_reset_btn'):
+            self._reset_btn.configure(
+                bg=t['btn_bg'],
+                fg=t['fg_secondary'],
+                activebackground=t['btn_active_bg']
+            )
         if hasattr(self, 'anim'):
             try:
                 self.anim._blit_cache.clear()
@@ -1215,12 +1674,16 @@ class EMGSimulatorApp:
         Returns a list of the changed artists -- required by blit=True.
         """
         with self._buffer_lock:
-            for ch in range(N_CHANNELS):
-                # Convert deque to numpy array for set_ydata()
-                # np.array(deque) creates a copy -- safe because the lock prevents
-                # the data thread from writing while we're reading
-                data = np.array(self.display_buffers[ch])
-                self.lines[ch].set_ydata(data)
+                    for display_pos in range(N_CHANNELS):
+                        ch_idx = self.channel_order[display_pos]
+
+                        if self.channel_enabled[ch_idx]:
+                            data = np.array(self.display_buffers[ch_idx])
+                        else:
+                            # Disabled channel shows a flat zero line
+                            data = np.zeros(len(self.time_axis))
+
+                        self.lines[display_pos].set_ydata(data)
 
         # Update status labels (these are cheap Tkinter text changes)
         self.elapsed_lbl.config(text=f"Elapsed: {self.total_elapsed:.1f} s")
