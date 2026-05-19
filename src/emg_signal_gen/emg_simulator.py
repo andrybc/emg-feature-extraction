@@ -47,6 +47,7 @@ import tkinter as tk
 import tempfile
 import shutil
 from tkinter import messagebox, filedialog
+import pandas as pd
 # =============================================================================
 # PATH RESOLUTION
 # When packaged with PyInstaller (frozen), __file__ does not exist.
@@ -319,13 +320,14 @@ class DataRecorder:
         self._queue        = queue.Queue(maxsize=5000)  # backpressure limit
         self._writer_thread = None
 
-    def start(self, output_path: str):
+    def start(self, output_path: str, fs: int = DEFAULT_FS):
         """Begin recording to the given CSV file path."""
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
         self.output_path  = output_path
         self.sample_count = 0
         self.is_recording = True
+        self._fs          = fs
 
         self._file   = open(output_path, 'w', newline='', buffering=1)
         self._writer = csv.writer(self._file)
@@ -345,7 +347,7 @@ class DataRecorder:
             mf.write("EMG Simulator Recording\n")
             mf.write("=" * 40 + "\n")
             mf.write(f"Recorded:      {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-            mf.write(f"Sampling rate: {self.fs} Hz\n")
+            mf.write(f"Sampling rate: {self._fs} Hz\n")
             mf.write(f"Channels:      {N_CHANNELS}\n")
             mf.write(f"Output file:   {os.path.basename(output_path)}\n\n")
             mf.write("Gesture Labels:\n")
@@ -402,7 +404,7 @@ class DataRecorder:
                 samples, label, gesture_name, t_start = self._queue.get(timeout=0.05)
 
                 for i, row_vals in enumerate(samples):
-                    timestamp = t_start + i / self.fs
+                    timestamp = t_start + i / self._fs
                     csv_row   = (
                         [f'{timestamp:.6f}']
                         + [f'{v:.8f}' for v in row_vals]
@@ -523,6 +525,20 @@ class EMGSimulatorApp:
                  bg='#0f172a', fg='#334155',
                  font=('Helvetica', 10))
         self.subtitle_label.pack(side='left')
+
+        #adding import button
+        self.calibration_btn = tk.Button(
+            top,
+            text="Import Calibration",
+            command=self._import_calibration,
+            bg='#1e293b', fg='#a78bfa',
+            activebackground='#263d5e', activeforeground='#c4b5fd',
+            relief='flat',
+            font=('Helvetica', 9, 'bold'),
+            cursor='hand2',
+            padx=8, pady=4
+        )
+        self.calibration_btn.pack(side='right', padx=(0, 8))
 
         self.theme_btn = tk.Button(
             top,
@@ -1288,6 +1304,424 @@ class EMGSimulatorApp:
                 fg='#1e3a5f'
             )
 
+    def _import_calibration(self):
+        """
+        Show a popup letting the user choose between two import paths:
+            1. From CSV  -- a pre-computed calibration table
+            2. From .mat -- a raw NinaPro file (converted to CSV first)
+
+        Either path ends with a CSV being loaded and GESTURE_CONFIG updated.
+        """
+        popup = tk.Toplevel(self.root)
+        popup.title("Import Calibration")
+        popup.configure(bg=self.theme['bg_primary'])
+        popup.resizable(False, False)
+        popup.grab_set()  # Make popup modal (blocks interaction with main window)
+
+        # Center popup over the main window
+        popup.geometry("340x180")
+        self.root.update_idletasks()
+        x = self.root.winfo_x() + self.root.winfo_width()  // 2 - 170
+        y = self.root.winfo_y() + self.root.winfo_height() // 2 - 90
+        popup.geometry(f"+{x}+{y}")
+
+        tk.Label(
+            popup,
+            text="How would you like to import calibration data?",
+            bg=self.theme['bg_primary'],
+            fg=self.theme['fg_primary'],
+            font=('Helvetica', 10),
+            wraplength=300,
+            justify='center'
+        ).pack(pady=(20, 6))
+
+        tk.Label(
+            popup,
+            text="Either path creates or loads a calibration CSV",
+            bg=self.theme['bg_primary'],
+            fg=self.theme['fg_secondary'],
+            font=('Helvetica', 8),
+        ).pack(pady=(0, 16))
+
+        btn_frame = tk.Frame(popup, bg=self.theme['bg_primary'])
+        btn_frame.pack()
+
+        tk.Button(
+            btn_frame,
+            text="From CSV",
+            command=lambda: [popup.destroy(), self._import_from_csv()],
+            bg=self.theme['btn_bg'],
+            fg='#a78bfa',
+            activebackground=self.theme['btn_active_bg'],
+            relief='flat',
+            font=('Helvetica', 10, 'bold'),
+            width=12, pady=8, cursor='hand2'
+        ).pack(side='left', padx=8)
+
+        tk.Button(
+            btn_frame,
+            text="From .mat (NinaPro)",
+            command=lambda: [popup.destroy(), self._import_from_mat()],
+            bg=self.theme['btn_bg'],
+            fg='#60a5fa',
+            activebackground=self.theme['btn_active_bg'],
+            relief='flat',
+            font=('Helvetica', 10, 'bold'),
+            width=18, pady=8, cursor='hand2'
+        ).pack(side='left', padx=8)
+
+    def _import_from_csv(self):
+        """
+        Load a calibration CSV directly and apply it to GESTURE_CONFIG.
+        The CSV must have been generated by ninapro_to_calibration.py
+        or exported by the simulator itself.
+        """
+        csv_path = filedialog.askopenfilename(
+            title="Select Calibration CSV",
+            initialdir=os.path.expanduser("~"),
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")]
+        )
+
+        if not csv_path:
+            return  # User cancelled
+
+        try:
+            # Import the loader from our conversion script if available,
+            # otherwise load and validate inline
+            try:
+                from ninapro_to_calibration import load_calibration_csv
+                df = load_calibration_csv(csv_path)
+            except ImportError:
+                # ninapro_to_calibration.py not on path -- load inline
+                df = pd.read_csv(csv_path)
+
+            self._apply_calibration(df, source_path=csv_path)
+
+        except Exception as e:
+            messagebox.showerror(
+                "Import Failed",
+                f"Could not load calibration CSV.\n\nError: {e}"
+            )
+
+    def _import_from_mat(self):
+        """
+        Load a NinaPro .mat file, convert it to a calibration CSV,
+        save the CSV next to the .mat file, then apply it to GESTURE_CONFIG.
+        """
+        mat_path = filedialog.askopenfilename(
+            title="Select NinaPro .mat File",
+            initialdir=os.path.expanduser("~"),
+            filetypes=[("MAT files", "*.mat"), ("All files", "*.*")]
+        )
+
+        if not mat_path:
+            return  # User cancelled
+
+        # Ask where to save the generated CSV
+        default_csv = os.path.splitext(mat_path)[0] + '_calibration.csv'
+        csv_path = filedialog.asksaveasfilename(
+            title="Save Calibration CSV As",
+            initialdir=os.path.dirname(mat_path),
+            initialfile=os.path.basename(default_csv),
+            defaultextension=".csv",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")]
+        )
+
+        if not csv_path:
+            return  # User cancelled save dialog
+
+        # Update status while converting (can take a few seconds)
+        self.file_info_label.config(
+            text="Converting .mat file...", fg='#60a5fa'
+        )
+        self.root.update()  # Force UI refresh so label appears immediately
+
+        try:
+            try:
+                # Use the standalone script if available
+                from ninapro_to_calibration import convert_mat_to_calibration_csv
+                convert_mat_to_calibration_csv(mat_path, csv_path)
+            except ImportError:
+                # Fallback: requires scipy and pandas inline
+                import scipy.io as sio
+                mat        = sio.loadmat(mat_path)
+                emg        = mat['emg'].astype(np.float64)[:, :N_CHANNELS]
+                labels_arr = mat['restimulus'].flatten().astype(int)
+
+                from ninapro_to_calibration import (
+                    NINAPRO_GESTURE_MAP, SIMULATOR_LABELS,
+                    compute_calibration_table, save_calibration_csv
+                )
+                data = {'emg': emg, 'labels': labels_arr, 'repetitions': np.zeros_like(labels_arr)}
+                df   = compute_calibration_table(data, NINAPRO_GESTURE_MAP)
+                save_calibration_csv(df, csv_path)
+
+            # Now load the saved CSV and apply it
+            df = pd.read_csv(csv_path)
+            self._apply_calibration(df, source_path=csv_path)
+
+        except Exception as e:
+            messagebox.showerror(
+                "Conversion Failed",
+                f"Could not convert .mat file.\n\n"
+                f"Make sure scipy is installed: pip install scipy\n\n"
+                f"Error: {e}"
+            )
+            self.file_info_label.config(
+                text="Conversion failed", fg='#f87171'
+            )
+
+    def _apply_calibration(self, df: 'pd.DataFrame', source_path: str = ""):
+            """
+            Apply a calibration DataFrame to GESTURE_CONFIG.
+
+            Deliberately flexible -- handles whatever column naming or
+            structure the colleague sends, as long as it has:
+                - One column identifiable as gesture name
+                - Eight columns identifiable as channel values
+                - Optionally one column for overall amplitude
+            """
+            # ------------------------------------------------------------------
+            # STEP 1: Find the gesture name column
+            # Try common names in order of preference
+            # ------------------------------------------------------------------
+            name_col = None
+            for candidate in ['gesture_name', 'gesture', 'name', 'Gesture',
+                            'Gesture_Name', 'label_name']:
+                if candidate in df.columns:
+                    name_col = candidate
+                    break
+
+            if name_col is None:
+                # Last resort: use the first string column
+                for col in df.columns:
+                    if df[col].dtype == object:
+                        name_col = col
+                        break
+
+            if name_col is None:
+                messagebox.showerror(
+                    "Import Failed",
+                    "Could not find a gesture name column.\n\n"
+                    "The file needs at least one column with gesture names like:\n"
+                    "  gesture_name, gesture, name\n\n"
+                    f"Columns found: {list(df.columns)}"
+                )
+                return
+
+            # ------------------------------------------------------------------
+            # STEP 2: Find the 8 channel columns
+            # Accept any of these naming patterns:
+            #   ch1_rms, ch1, channel_1, Channel1, CH1, emg1, electrode1
+            # We look for exactly 8 numeric columns that look like channels
+            # ------------------------------------------------------------------
+            ch_cols = []
+
+            # Try strict patterns first
+            strict_patterns = [
+                [f'ch{i+1}_rms'    for i in range(N_CHANNELS)],
+                [f'ch{i+1}'        for i in range(N_CHANNELS)],
+                [f'channel_{i+1}'  for i in range(N_CHANNELS)],
+                [f'Channel{i+1}'   for i in range(N_CHANNELS)],
+                [f'CH{i+1}'        for i in range(N_CHANNELS)],
+                [f'emg{i+1}'       for i in range(N_CHANNELS)],
+                [f'electrode{i+1}' for i in range(N_CHANNELS)],
+                [f'EMG{i+1}'       for i in range(N_CHANNELS)],
+            ]
+
+            for pattern in strict_patterns:
+                if all(c in df.columns for c in pattern):
+                    ch_cols = pattern
+                    break
+
+            if not ch_cols:
+                # Fallback: grab all numeric columns that are not known non-channel columns
+                skip_cols = {
+                    name_col, 'gesture_label', 'label', 'ninapro_label',
+                    'n_samples', 'samples', 'peak_amplitude', 'amplitude',
+                    'peak', 'normalized'
+                }
+                numeric_cols = [
+                    c for c in df.columns
+                    if c not in skip_cols
+                    and df[c].dtype in (np.float64, np.float32, np.int64, np.int32)
+                    or (c not in skip_cols and df[c].dtype == object
+                        and df[c].str.match(r'^-?\d+\.?\d*$').all()
+                        if c not in skip_cols and df[c].dtype == object else False)
+                ]
+                # Re-filter cleanly
+                numeric_cols = [
+                    c for c in df.columns
+                    if c not in skip_cols
+                    and pd.api.types.is_numeric_dtype(df[c])
+                ]
+
+                if len(numeric_cols) >= N_CHANNELS:
+                    # Use the first 8 numeric columns
+                    ch_cols = numeric_cols[:N_CHANNELS]
+                elif len(numeric_cols) > 0:
+                    messagebox.showerror(
+                        "Import Failed",
+                        f"Found {len(numeric_cols)} numeric channel columns "
+                        f"but need exactly {N_CHANNELS}.\n\n"
+                        f"Numeric columns found: {numeric_cols}\n\n"
+                        f"Expected column names like:\n"
+                        f"  ch1, ch2 ... ch8\n"
+                        f"  channel_1, channel_2 ... channel_8\n"
+                        f"  CH1, CH2 ... CH8"
+                    )
+                    return
+                else:
+                    messagebox.showerror(
+                        "Import Failed",
+                        f"Could not find any numeric channel columns.\n\n"
+                        f"Columns in file: {list(df.columns)}"
+                    )
+                    return
+
+            # ------------------------------------------------------------------
+            # STEP 3: Find the amplitude column (optional)
+            # If not present we compute it as the max channel value per row
+            # ------------------------------------------------------------------
+            amp_col = None
+            for candidate in ['peak_amplitude', 'amplitude', 'peak',
+                            'Amplitude', 'Peak_Amplitude']:
+                if candidate in df.columns:
+                    amp_col = candidate
+                    break
+
+            # ------------------------------------------------------------------
+            # STEP 4: Normalize channel values to 0-1 range
+            # If the colleague sends raw mV values instead of normalized,
+            # we normalize automatically so the simulator still works correctly
+            # ------------------------------------------------------------------
+            ch_data    = df[ch_cols].values.astype(np.float64)
+            global_max = ch_data.max()
+
+            if global_max > 1.0:
+                # Values are not normalized -- do it now
+                ch_data = ch_data / global_max
+                auto_normalized = True
+            else:
+                auto_normalized = False
+
+            # ------------------------------------------------------------------
+            # STEP 5: Apply to GESTURE_CONFIG
+            # Match rows by gesture name, case-insensitive and strip whitespace
+            # ------------------------------------------------------------------
+            updated = []
+            skipped = []
+            unmatched = []
+
+            # Build a lowercase lookup of our gesture names
+            gesture_lookup = {
+                name.lower().strip(): name
+                for name in GESTURE_CONFIG.keys()
+            }
+
+            for row_idx, row in df.iterrows():
+                raw_name     = str(row[name_col]).strip()
+                lookup_key   = raw_name.lower()
+                matched_name = gesture_lookup.get(lookup_key)
+
+                # Also try partial matching
+                # e.g. "wrist_flexion" should match "Wrist Flexion"
+                if matched_name is None:
+                    normalized_key = lookup_key.replace('_', ' ').replace('-', ' ')
+                    matched_name   = gesture_lookup.get(normalized_key)
+
+                if matched_name is None:
+                    unmatched.append(raw_name)
+                    continue
+
+                pattern   = ch_data[row_idx]
+                amplitude = (
+                    float(row[amp_col])
+                    if amp_col is not None
+                    else float(pattern.max())
+                )
+
+                # Rest always gets a small fixed amplitude regardless of file
+               # if matched_name == 'Rest':
+                 #   amplitude = 0.065
+
+                GESTURE_CONFIG[matched_name]['pattern']   = pattern
+                GESTURE_CONFIG[matched_name]['amplitude'] = amplitude
+                updated.append(matched_name)
+
+            # ------------------------------------------------------------------
+            # STEP 6: Report results
+            # ------------------------------------------------------------------
+            if not updated:
+                messagebox.showwarning(
+                    "Nothing Updated",
+                    f"No gesture names in the file matched the simulator.\n\n"
+                    f"Simulator expects (case-insensitive):\n"
+                    f"  {list(GESTURE_CONFIG.keys())}\n\n"
+                    f"File contained:\n"
+                    f"  {list(df[name_col])}"
+                )
+                return
+
+            fname = os.path.basename(source_path) if source_path else "file"
+            self.file_info_label.config(
+                text=f"Calibrated: {fname}", fg='#a78bfa'
+            )
+            self.calibration_btn.config(fg='#34d399')
+            # Console output: print the full calibration table that was applied
+            print("\n" + "=" * 65)
+            print("  CALIBRATION APPLIED")
+            print("=" * 65)
+            print(f"  Source: {source_path or 'unknown'}")
+            print(f"  Auto-normalized: {auto_normalized}")
+            print()
+
+            # Header row
+            header = f"  {'Gesture':<20}" + "".join(f"  CH{i+1:<5}" for i in range(N_CHANNELS)) + "  Amplitude"
+            print(header)
+            print("  " + "-" * (len(header) - 2))
+
+            # One row per updated gesture
+            for row_idx, row in df.iterrows():
+                raw_name     = str(row[name_col]).strip()
+                lookup_key   = raw_name.lower()
+                matched_name = gesture_lookup.get(lookup_key)
+
+                if matched_name is None:
+                    normalized_key = lookup_key.replace('_', ' ').replace('-', ' ')
+                    matched_name   = gesture_lookup.get(normalized_key)
+
+                if matched_name not in updated:
+                    continue
+
+                pattern   = GESTURE_CONFIG[matched_name]['pattern']
+                amplitude = GESTURE_CONFIG[matched_name]['amplitude']
+
+                ch_values = "".join(f"  {v:<7.4f}" for v in pattern)
+                print(f"  {matched_name:<20}{ch_values}  {amplitude:.4f}")
+
+            print("=" * 65 + "\n")           
+
+            notes = []
+            if auto_normalized:
+                notes.append("Values were raw mV -- auto-normalized to 0-1 range.")
+            if unmatched:
+                notes.append(f"Unrecognized gestures skipped: {unmatched}")
+            if len(updated) < len(GESTURE_CONFIG):
+                missing = [g for g in GESTURE_CONFIG if g not in updated]
+                notes.append(
+                    f"Gestures not in file (kept default values): {missing}"
+                )
+
+            messagebox.showinfo(
+                "Calibration Applied",
+                f"Gesture config updated successfully.\n\n"
+                f"Source:   {fname}\n"
+                f"Updated:  {', '.join(updated)}\n"
+                f"Channels: {ch_cols}\n"
+                + ("\nNotes:\n" + "\n".join(f"  - {n}" for n in notes) if notes else "")
+            )
+
     def _toggle_theme(self):
             """Switch between dark and light mode."""
             if self.theme_name == 'dark':
@@ -1375,7 +1809,13 @@ class EMGSimulatorApp:
         # Clear the blit background cache so the animation picks up new colors
         # Without this, FuncAnimation keeps restoring the old cached background
         # on every frame, overwriting the theme change until a resize forces a reset
-
+        
+        # Calibration button
+        if hasattr(self, 'calibration_btn'):
+            self.calibration_btn.configure(
+                bg=t['btn_bg'],
+                activebackground=t['btn_active_bg']
+            )
         
         # Rebuild channel rows so ON/OFF buttons and labels use new theme colors
         if hasattr(self, '_ch_rows_frame'):
@@ -1460,7 +1900,7 @@ class EMGSimulatorApp:
         fd, self._temp_csv_path = tempfile.mkstemp(suffix='.csv', prefix='emg_tmp_')
         os.close(fd)
 
-        self.recorder.start(self._temp_csv_path)
+        self.recorder.start(self._temp_csv_path, fs=self.fs)
         self.rec_start_time = time.time()
 
         self.rec_btn.config(text="  Stop Recording", fg='#fbbf24')

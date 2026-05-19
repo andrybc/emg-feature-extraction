@@ -151,9 +151,10 @@ if __name__ == '__main__':
             sys.exit(1)
 
         csvs = sorted(
-            [f for f in os.listdir(sim_dir) if f.endswith('.csv')],
-            reverse=True   # Most recent first
-        )
+                    [f for f in os.listdir(sim_dir) if f.endswith('.csv')],
+                    key=lambda f: os.path.getmtime(os.path.join(sim_dir, f)),
+                    reverse=True   # Most recently modified first
+                )
 
         if not csvs:
             print(f"No CSV files found in {sim_dir}")
