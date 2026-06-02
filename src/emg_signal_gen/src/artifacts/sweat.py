@@ -241,7 +241,48 @@ class SweatProcessor:
         # (not larger than) signal amplitude at full sweat.
         drift_amplitude = self.drift_scale * s * self._running_rms * 30.0  # shape (C,)
         out = out + drift_trace * drift_amplitude
-        # TODO mechanism 4: powerline pickup from CMRR loss
+        #
+        
+        
+        
+        # --- Mechanism 4: powerline pickup from CMRR loss (Webster 1984; Xu et al. 2020) ---
+        # Sweat creates asymmetric electrode-skin impedance. Asymmetric impedance
+        # breaks the differential amplifier's common-mode rejection, so 60 Hz
+        # (or 50 Hz in Europe) from the local wall-power environment leaks into
+        # the recording as a differential signal. Amplitude per channel scales
+        # with that channel's fixed imbalance factor, the current sweat level,
+        # and the rolling signal RMS.
+
+        # Step 1: vectorized sine values across the buffer.
+        # Phase advances continuously across buffers via _powerline_phase.
+        t_indices = np.arange(n_samples)                                          # shape (T,)
+        phase_per_sample = (
+            self._powerline_phase
+            + 2.0 * np.pi * self.powerline_freq * t_indices / self.fs
+        )
+        sine_values = np.sin(phase_per_sample)                                    # shape (T,)
+
+        # Step 2: update phase for next buffer call. Modulo keeps it bounded.
+        self._powerline_phase = (
+            self._powerline_phase
+            + 2.0 * np.pi * self.powerline_freq * n_samples / self.fs
+        ) % (2.0 * np.pi)
+
+        # Step 3: per-channel amplitude. Imbalance is fixed per channel; sweat
+        # and RMS scale dynamically. Shape (C,).
+        powerline_amplitude = (
+            self._per_channel_imbalance * s * self._running_rms
+        )
+
+        # Step 4: outer-product-style broadcast: (T,) × (C,) -> (T, C)
+        # sine_values[:, None] has shape (T, 1); powerline_amplitude[None, :] has shape (1, C).
+        # The product is (T, C), where every row is the same sine value times the
+        # per-channel amplitude vector.
+        powerline_signal = sine_values[:, None] * powerline_amplitude[None, :]    # shape (T, C)
+
+        out = out + powerline_signal        
+        
+        
 
         return out
 
