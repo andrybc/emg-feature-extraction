@@ -295,6 +295,14 @@ class SweatProcessor:
         Move _current_sweat_level toward _target_sweat_level using a
         first-order step. dt is the duration of this buffer.
         """
+        # Offline mode: snap immediately. Must come BEFORE effective_tau
+        # is computed, otherwise tau_sweat=0 propagates into a divide-by-zero.
+        if self.tau_sweat <= 0.0:
+            self._current_sweat_level = self._target_sweat_level
+            return
+
+        # Use a faster time constant when decaying toward zero. This makes
+        # the "Dry" button feel responsive without sacrificing the slow buildup.
         if self._target_sweat_level == 0.0:
             effective_tau = self.tau_sweat * 0.2   # 1-second decay
         else:
