@@ -216,10 +216,31 @@ class SweatProcessor:
         out, self._lp_zi = dsp.lfilter(b, a, out, axis=0, zi=self._lp_zi)
 
 
+        # --- Mechanism 3: baseline drift (De Luca et al. 2010) ---
+        # Low-frequency wandering of the baseline voltage caused by sweat-induced
+        # electrochemistry changes at the skin-electrode interface. Modeled as
+        # white noise low-passed to below 1 Hz. The lowpass output is already
+        # slowly-correlated and "wanders" naturally; no integrator is needed.
 
+        # Step 1: white Gaussian noise per buffer.
+        noise = self._rng.standard_normal(size=(n_samples, self.n_channels))
 
-        
-        # TODO mechanism 3: baseline drift
+        # Step 2: low-pass filter to sub-1-Hz content. State preserved across buffers.
+        if self._drift_noise_zi is None:
+            zi_single = dsp.lfilter_zi(self._drift_b, self._drift_a)  # shape (2,)
+            self._drift_noise_zi = np.zeros((len(zi_single), self.n_channels))
+
+        drift_trace, self._drift_noise_zi = dsp.lfilter(
+            self._drift_b, self._drift_a, noise, axis=0, zi=self._drift_noise_zi
+        )
+
+        # Step 3: scale by per-channel sweat and signal RMS, then add to signal.
+        # drift_trace already has std around 0.03 from the lowpass alone. The
+        # scale factor needs to bring this up to something visible relative to
+        # signal RMS. We boost by a fixed factor that makes drift comparable to
+        # (not larger than) signal amplitude at full sweat.
+        drift_amplitude = self.drift_scale * s * self._running_rms * 30.0  # shape (C,)
+        out = out + drift_trace * drift_amplitude
         # TODO mechanism 4: powerline pickup from CMRR loss
 
         return out
