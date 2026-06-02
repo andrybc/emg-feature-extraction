@@ -175,7 +175,7 @@ class SweatProcessor:
         # ----- 2. Bit-exact pass-through (Q4 option A) -----
         # If both target and current are at/near zero, snap current to 0
         # and return the input unchanged. Decay tail below 1e-6 is invisible.
-        if self._target_sweat_level == 0.0 and self._current_sweat_level < 1e-6:
+        if self._target_sweat_level == 0.0 and self._current_sweat_level < 0.01:
             self._current_sweat_level = 0.0
             return buffer
 
@@ -295,17 +295,17 @@ class SweatProcessor:
         Move _current_sweat_level toward _target_sweat_level using a
         first-order step. dt is the duration of this buffer.
         """
-        if self.tau_sweat <= 0.0:
-            # Offline mode: snap immediately.
-            self._current_sweat_level = self._target_sweat_level
-            return
+        if self._target_sweat_level == 0.0:
+            effective_tau = self.tau_sweat * 0.2   # 1-second decay
+        else:
+            effective_tau = self.tau_sweat
 
         dt    = n_samples / self.fs
-        alpha = 1.0 - np.exp(-dt / self.tau_sweat)
+        alpha = 1.0 - np.exp(-dt / effective_tau)
         self._current_sweat_level += alpha * (
             self._target_sweat_level - self._current_sweat_level
         )
-
+        
     def _update_running_rms(self, buffer: np.ndarray, n_samples: int) -> None:
         """
         Exponentially smoothed RMS per channel. Seeded with the first
@@ -328,14 +328,9 @@ class SweatProcessor:
         self._running_rms = np.sqrt(ms_smoothed)
 
     def _design_drift_noise_filter(self) -> None:
-        """
-        Design the low-pass filter that shapes white noise into a
-        sub-1-Hz random walk. Cutoff is fixed, so we design once.
-        """
-        # Cutoff at 0.5 Hz: drift fluctuations on the order of 1-2 seconds.
-        cutoff = 0.5
+        """..."""
         nyq    = 0.5 * self.fs
-        # 2nd-order Butterworth low-pass. Cheap and stable at very low cutoffs.
+        cutoff = min(0.5, 0.45 * nyq)               # clamp for tiny fs
         self._drift_b, self._drift_a = dsp.butter(
             N=2, Wn=cutoff / nyq, btype='low'
         )
@@ -356,9 +351,17 @@ class SweatProcessor:
         # Step 2: quantize to nearest 5 Hz to enable design caching.
         quantized = round(cutoff_hz / 5.0) * 5.0
 
-        # Step 3: rebuild only on quantized-cutoff change.
+        # Step 3: clamp cutoff to be safely below Nyquist. At very low sample
+        # rates (e.g. 250 Hz, Nyquist 125 Hz), the dry cutoff of 400 Hz would
+        # exceed Nyquist and crash butter(). Clamp to 0.45 * Nyquist as a safe
+        # upper bound; 0.45 gives some margin from the hard Nyquist limit.
+        nyq = 0.5 * self.fs
+        max_safe_cutoff = 0.45 * nyq                    # 45% of fs/2
+        min_safe_cutoff = 1.0                           # 1 Hz floor
+        quantized = max(min_safe_cutoff, min(quantized, max_safe_cutoff))
+
+        # Step 4: rebuild only on quantized-cutoff change.
         if quantized != self._lp_last_cutoff:
-            nyq = 0.5 * self.fs
             self._lp_b, self._lp_a = dsp.butter(
                 N=4, Wn=quantized / nyq, btype='low'
             )
