@@ -175,15 +175,6 @@ CHANNEL_COLORS = [
     '#a78bfa', '#fbbf24', '#4ade80', '#f87171',
 ]
 
-# =============================================================================
-# EMG SIGNAL GENERATOR
-# Generates realistic-looking simulated EMG using:
-#   1. Gaussian noise as the random source (motor unit action potentials)
-#   2. An IIR filter to shape the frequency spectrum (EMG is band-limited)
-#   3. A smooth activation envelope (muscles do not switch on instantly)
-#   4. Per-channel activation patterns (different muscles per gesture)
-# =============================================================================
-
 class EMGSignalGenerator:
     """
     Produces multi-channel EMG samples on demand.
@@ -201,44 +192,134 @@ class EMGSignalGenerator:
         self.active_gesture = 'Rest'
 
         # Envelope: 0.0 = fully at rest, 1.0 = fully activated
-        # Updated each sample to create a smooth rise/fall
+        # Updated each sample to create a smooth rise/fall.
         self.envelope = 0.0
 
-        # Per-channel IIR filter state (x = input history, y = output history)
-        # This shapes white noise into band-limited EMG-like noise.
-        # The coefficients approximate a bandpass characteristic without
-        # calling scipy.signal.butter in real time (which would be slow).
+        # ==============================================================
+        # UPGRADE 1: SMOOTH PATTERN TRANSITIONS
+        # ==============================================================
+        # WHY THIS EXISTS
+        # ---------------
+        # Real muscles do not switch their per-channel activation pattern
+        # in a single sample (1 ms at fs=1000). The old code did exactly
+        # that: clicking "Wrist Flexion" while "Hand Closed" was active
+        # caused channels 3-6 to jump to entirely new amplitudes inside
+        # one sample. The envelope (0->1) smoothed the overall on/off
+        # transition, but the per-channel mix snapped instantly.
+        #
+        # THE FIX: TWO VECTORS
+        # --------------------
+        # Hold two per-channel amplitude vectors and walk one toward the
+        # other one sample at a time.
+        #
+        #   target_peak  = where the per-channel amplitudes WANT to be
+        #                  (set instantly by set_gesture())
+        #   current_peak = where the per-channel amplitudes ARE right now
+        #                  (lerped toward target_peak each sample)
+        #
+        # The inner loop reads current_peak to drive the noise amplitude,
+        # so the user sees a smooth per-channel blend between gestures
+        # instead of a hard jump.
+        #
+        # WHY INDEPENDENT FROM THE ENVELOPE
+        # ---------------------------------
+        # Envelope answers "how strong overall" (rest vs gesture).
+        # Pattern crossfade answers "which channels are active".
+        # Keeping them separate makes gesture -> gesture transitions
+        # work automatically: envelope stays at 1.0, but current_peak
+        # migrates from one gesture's pattern to the next.
+        #
+        # WHY PRE-MULTIPLIED (amplitude * pattern)
+        # ----------------------------------------
+        # The inner loop in the old code re-multiplied cfg['amplitude']
+        # by cfg['pattern'][ch] for every sample of every channel. We
+        # do that multiply ONCE per gesture change instead, and the
+        # inner loop reads the product directly. Same numbers, fewer
+        # operations per sample.
+        #
+        # WHY .copy() MATTERS
+        # -------------------
+        # numpy expressions like a*b already return a new array, so
+        # rest_peak is its own buffer. We still .copy() both vectors
+        # to be explicit that target_peak and current_peak are two
+        # INDEPENDENT arrays. If they ever became views of the same
+        # buffer, walking current toward target would be walking the
+        # array toward itself and it would never move.
+        # ==============================================================
+        rest_cfg  = GESTURE_CONFIG['Rest']
+        rest_peak = rest_cfg['amplitude'] * rest_cfg['pattern']  # shape (8,)
+        self.target_peak  = rest_peak.copy()
+        self.current_peak = rest_peak.copy()
+
+        # Time constant of the crossfade, in seconds.
+        # With tau = 50 ms, the crossfade is ~95% complete after 3*tau
+        # (150 ms) and effectively done by 5*tau (250 ms). That lands
+        # in the middle of the 100-200 ms target window.
+        #
+        # Grounded in EMG literature: Hudgins, Parker, Scott (1993)
+        # document that the deterministic transient phase of muscle
+        # contraction lasts roughly the first 200-300 ms before
+        # settling to steady state. A 150 ms perceived crossfade fits
+        # inside that window.
+        #
+        # Single global value for now. Upgrade 2 will promote this to
+        # a per-gesture lookup driven by GESTURE_CONFIG (small hand
+        # muscles fast, forearm muscles slower).
+        self.pattern_tau_s = 0.050
+
+        # Per-channel IIR filter state (x = input history, y = output history).
+        # Shapes white noise into band-limited EMG-like noise. Approximates
+        # a bandpass characteristic without calling scipy.signal.butter
+        # in real time (which would be slow).
         self._fs_state = [
             {'x1': 0.0, 'x2': 0.0, 'y1': 0.0, 'y2': 0.0}
             for _ in range(n_channels)
         ]
 
     def set_gesture(self, gesture_name: str):
-        """Switch the active gesture. The envelope will transition smoothly."""
+        """Switch the active gesture. The envelope and pattern transition smoothly."""
         if gesture_name in GESTURE_CONFIG:
             self.active_gesture = gesture_name
+
+            # ==========================================================
+            # UPGRADE 1: jump target_peak to the new gesture's
+            # pre-multiplied (amplitude * pattern) vector.
+            #
+            # We deliberately do NOT touch current_peak. That is the
+            # whole point of the crossfade:
+            #
+            #   target_peak  = "where we want to be" (jumps instantly)
+            #   current_peak = "where we are"        (walks toward target
+            #                                         inside generate_samples)
+            #
+            # The gap between them IS the transition. If we also reset
+            # current_peak here we would erase the crossfade and be
+            # back to the old hard-switch behavior.
+            #
+            # Reading GESTURE_CONFIG fresh here means a calibration
+            # import that mutates the pattern in-place takes effect on
+            # the next gesture click, identical to the old behavior.
+            # ==========================================================
+            cfg = GESTURE_CONFIG[gesture_name]
+            self.target_peak = cfg['amplitude'] * cfg['pattern']
 
     def _shape_noise(self, channel: int, amplitude: float) -> float:
         """
         Apply a simple recursive IIR filter to white noise.
 
-        This gives the noise a more EMG-like frequency shape:
-        more energy in the 50-300 Hz range, less in DC and very high frequencies.
+        Gives the noise a more EMG-like frequency shape: more energy in
+        the 50-300 Hz range, less in DC and very high frequencies.
 
-        The formula is a simplified 2nd-order difference equation:
             y[n] = 0.62*x[n] - 0.62*x[n-2] - 0.22*y[n-1] + 0.04*y[n-2]
 
-        This is NOT a proper Butterworth filter (that is applied in the notebook
-        preprocessing step). This is just a fast approximation for visual realism.
+        Not a proper Butterworth filter (that lives in the notebook
+        preprocessing step). Just a fast approximation for visual realism.
         """
-        # Draw one sample from N(0,1) -- approximated by summing 3 uniform RVs
-        # (Central Limit Theorem: sum of uniforms approaches Gaussian)
         x = np.random.randn()
 
         f = self._fs_state[channel]
         y = 0.62*x - 0.62*f['x2'] - 0.22*f['y1'] + 0.04*f['y2']
 
-        # Shift filter memory
         f['x2'] = f['x1']
         f['x1'] = x
         f['y2'] = f['y1']
@@ -266,10 +347,38 @@ class EMGSignalGenerator:
         is_rest  = (self.active_gesture == 'Rest')
         label    = cfg['label']
 
-        # Target envelope: 0 for rest, 1 for any gesture
-        # Speed controls how fast the envelope rises (gesture start) or falls (rest)
+        # Target envelope: 0 for rest, 1 for any gesture.
+        # env_speed is still a fixed per-sample factor (so it implicitly
+        # assumes fs around 1000). Upgrade 2 will fix that. We leave it
+        # alone in this commit so Upgrade 1 is a minimal change.
         env_target = 0.0 if is_rest else 1.0
-        env_speed  = 0.04 if is_rest else 0.06   # per-sample factor
+        env_speed  = 0.04 if is_rest else 0.06
+
+        # ==============================================================
+        # UPGRADE 1: per-sample lerp factor for the pattern crossfade.
+        #
+        # Discrete-time exponential smoothing:
+        #     current += alpha * (target - current)
+        # gives an exponential approach to target with time constant
+        #     alpha = 1 - exp(-dt / tau)      (exact form, used here)
+        # where dt = 1 / fs is one sample period.
+        #
+        # WHY THE EXACT FORM (instead of alpha ~= dt/tau)
+        # ----------------------------------------------
+        # The approximation works fine at fs=1000 but drifts at low
+        # rates (fs=250) and high rates (fs=5000). The exact form
+        # keeps the perceived crossfade duration at ~150 ms regardless
+        # of sample rate, which matters because the user can switch
+        # fs live from the UI.
+        #
+        # WHY COMPUTE IT EVERY CALL
+        # -------------------------
+        # self.fs changes when the user picks a new sample rate from
+        # the dropdown. Recomputing here means the crossfade adapts
+        # to the new rate on the very next batch, no extra wiring
+        # required in _change_sample_rate.
+        # ==============================================================
+        alpha_pattern = 1.0 - np.exp(-1.0 / (self.fs * self.pattern_tau_s))
 
         samples = np.zeros((n_samples, self.n_channels))
 
@@ -277,19 +386,50 @@ class EMGSignalGenerator:
             # Step the envelope toward its target (smooth exponential approach)
             self.envelope += (env_target - self.envelope) * env_speed
 
+            # ==========================================================
+            # UPGRADE 1: step current_peak toward target_peak.
+            #
+            # ONE vectorized numpy operation over all 8 channels.
+            # target_peak and current_peak are both shape (8,), so
+            # subtraction and elementwise multiply broadcast across
+            # channels without any Python-level inner loop. Cost is
+            # on the order of a microsecond per sample, comfortably
+            # inside the per-buffer budget.
+            #
+            # When the gesture is steady, current_peak converges to
+            # target_peak and this line becomes a no-op (current +=
+            # alpha * 0). The output of the inner loop is then
+            # numerically identical to the old code in steady state,
+            # which means we have not changed anything users rely on
+            # for held gestures, only the behavior during transitions.
+            # ==========================================================
+            self.current_peak += (self.target_peak - self.current_peak) * alpha_pattern
+
             # Compute per-channel amplitude
             for ch in range(self.n_channels):
-                # At rest: use the Rest gesture's amplitude (noise floor)
-                # During gesture: interpolate to gesture's peak amplitude * pattern weight
+                # ======================================================
+                # UPGRADE 1: read peak amplitude from current_peak[ch]
+                # instead of recomputing it from cfg.
+                #
+                # OLD:
+                #   peak_amp = cfg['amplitude'] * cfg['pattern'][ch]
+                #
+                # NEW:
+                #   peak_amp = self.current_peak[ch]
+                #
+                # In steady state these are equal (current_peak has
+                # arrived at target_peak = cfg['amplitude'] * cfg['pattern']).
+                # During a transition, current_peak is somewhere between
+                # the old gesture's vector and the new one, which is
+                # exactly the smooth blend we wanted.
+                # ======================================================
                 base_amp = GESTURE_CONFIG['Rest']['amplitude']
-                peak_amp = cfg['amplitude'] * cfg['pattern'][ch]
+                peak_amp = self.current_peak[ch]
                 amp = base_amp + (peak_amp - base_amp) * self.envelope
 
                 samples[i, ch] = self._shape_noise(ch, amp)
 
         return samples, label
-
-
 # =============================================================================
 # DATA RECORDER
 # Writes EMG samples to a CSV file in a background thread.
