@@ -169,6 +169,44 @@ GESTURE_CONFIG = {
     },
 }
 
+
+
+# =============================================================================
+# CALIBRATION REALISM: per-gesture per-channel variability
+# =============================================================================
+# Real EMG amplitude is not deterministic. When you do the same gesture twice,
+# the per-channel RMS is similar but not identical. Reported coefficient of
+# variation across trials is roughly 10-20% per channel (Kapelner et al. 2018
+# on NinaPro DB7; Phinyomark et al. 2012 feature-stability review).
+#
+# To capture this we extend each gesture's config with a `pattern_std`
+# array: a per-channel standard deviation on the pattern. Each time the
+# user clicks a gesture button, the generator samples a fresh realization:
+#
+#     realized_pattern = pattern + pattern_std * randn(8)
+#     target_peak      = amplitude * realized_pattern
+#
+# The realization is SAMPLED ONCE PER CLICK, not per sample. Within a held
+# contraction the per-channel mix stays steady (which is realistic: RMS is
+# approximately stationary during a sustained gesture). Between contractions
+# of the same gesture, the realization shifts.
+#
+# DEFAULT_PATTERN_CV controls the default coefficient of variation when a
+# pattern_std is not explicitly provided. Set to 0.0 to disable variability
+# entirely and recover the deterministic pre-upgrade behavior.
+# =============================================================================
+DEFAULT_PATTERN_CV = 0.10  # 10% CV per channel; sits at the conservative end
+                           # of the literature range (10-20%).
+
+# Populate pattern_std for every gesture that doesn't already define one.
+# We do this in a loop rather than inline in GESTURE_CONFIG so the gesture
+# dict above stays compact and the CV is one easy-to-find knob.
+for _name, _cfg in GESTURE_CONFIG.items():
+    if 'pattern_std' not in _cfg:
+        _cfg['pattern_std'] = DEFAULT_PATTERN_CV * _cfg['pattern']
+
+        
+
 # Color for each of the 8 channels (used in the oscilloscope plot)
 CHANNEL_COLORS = [
     '#34d399', '#38bdf8', '#fb923c', '#f472b6',
@@ -179,7 +217,10 @@ class EMGSignalGenerator:
     """
     Produces multi-channel EMG samples on demand.
 
-    Call set_gesture() to change the active gesture.
+    Call set_gesture() to change the active gesture. Each call samples a
+    fresh per-channel realization from the gesture's (pattern, pattern_std)
+    distribution, modeling trial-to-trial variability.
+
     Call generate_samples(n) to get n new samples across all channels.
 
     This class is not thread-safe by itself. The caller (data loop thread)
@@ -191,117 +232,115 @@ class EMGSignalGenerator:
         self.n_channels  = n_channels
         self.active_gesture = 'Rest'
 
-        # Envelope: 0.0 = fully at rest, 1.0 = fully activated
-        # Updated each sample to create a smooth rise/fall.
+        # Envelope: 0.0 = fully at rest, 1.0 = fully activated.
         self.envelope = 0.0
 
         # ==============================================================
-        # UPGRADE 1: SMOOTH PATTERN TRANSITIONS
+        # UPGRADE 1 + CALIBRATION REALISM
         # ==============================================================
-        # WHY THIS EXISTS
-        # ---------------
-        # Real muscles do not switch their per-channel activation pattern
-        # in a single sample (1 ms at fs=1000). The old code did exactly
-        # that: clicking "Wrist Flexion" while "Hand Closed" was active
-        # caused channels 3-6 to jump to entirely new amplitudes inside
-        # one sample. The envelope (0->1) smoothed the overall on/off
-        # transition, but the per-channel mix snapped instantly.
+        # target_peak  = the per-channel peak amplitude vector the
+        #                active gesture is asking for. Jumps instantly
+        #                inside set_gesture(). See full Upgrade 1
+        #                rationale in set_gesture() and generate_samples().
+        # current_peak = the per-channel vector actually driving the
+        #                inner loop. Walks toward target_peak one
+        #                sample at a time (Upgrade 1 crossfade).
         #
-        # THE FIX: TWO VECTORS
-        # --------------------
-        # Hold two per-channel amplitude vectors and walk one toward the
-        # other one sample at a time.
+        # CHANGE FROM UPGRADE 1
+        # ---------------------
+        # Previously these were initialized inline here using
+        # cfg['amplitude'] * cfg['pattern'] directly. That duplicated
+        # logic with set_gesture(). Now we initialize as zeros and let
+        # set_gesture('Rest') do the actual sampling. Two reasons:
         #
-        #   target_peak  = where the per-channel amplitudes WANT to be
-        #                  (set instantly by set_gesture())
-        #   current_peak = where the per-channel amplitudes ARE right now
-        #                  (lerped toward target_peak each sample)
+        #   1. Single source of truth. set_gesture() is the ONLY place
+        #      that samples from (pattern, pattern_std). The constructor
+        #      delegating to it guarantees the very first realization
+        #      uses the same code path as every later gesture click.
         #
-        # The inner loop reads current_peak to drive the noise amplitude,
-        # so the user sees a smooth per-channel blend between gestures
-        # instead of a hard jump.
+        #   2. Calibration realism brings per-click variability via
+        #      pattern_std. We want even the initial Rest realization
+        #      to be drawn from that distribution, not hardcoded to
+        #      the mean.
         #
-        # WHY INDEPENDENT FROM THE ENVELOPE
-        # ---------------------------------
-        # Envelope answers "how strong overall" (rest vs gesture).
-        # Pattern crossfade answers "which channels are active".
-        # Keeping them separate makes gesture -> gesture transitions
-        # work automatically: envelope stays at 1.0, but current_peak
-        # migrates from one gesture's pattern to the next.
-        #
-        # WHY PRE-MULTIPLIED (amplitude * pattern)
-        # ----------------------------------------
-        # The inner loop in the old code re-multiplied cfg['amplitude']
-        # by cfg['pattern'][ch] for every sample of every channel. We
-        # do that multiply ONCE per gesture change instead, and the
-        # inner loop reads the product directly. Same numbers, fewer
-        # operations per sample.
-        #
-        # WHY .copy() MATTERS
-        # -------------------
-        # numpy expressions like a*b already return a new array, so
-        # rest_peak is its own buffer. We still .copy() both vectors
-        # to be explicit that target_peak and current_peak are two
-        # INDEPENDENT arrays. If they ever became views of the same
-        # buffer, walking current toward target would be walking the
-        # array toward itself and it would never move.
+        # After set_gesture('Rest') sets target_peak, we snap
+        # current_peak to match. Otherwise the first generate_samples()
+        # call would crossfade from zero to Rest amplitude over 150 ms,
+        # producing a brief startup transient the user never asked for.
         # ==============================================================
-        rest_cfg  = GESTURE_CONFIG['Rest']
-        rest_peak = rest_cfg['amplitude'] * rest_cfg['pattern']  # shape (8,)
-        self.target_peak  = rest_peak.copy()
-        self.current_peak = rest_peak.copy()
+        self.target_peak  = np.zeros(n_channels)
+        self.current_peak = np.zeros(n_channels)
 
-        # Time constant of the crossfade, in seconds.
-        # With tau = 50 ms, the crossfade is ~95% complete after 3*tau
-        # (150 ms) and effectively done by 5*tau (250 ms). That lands
-        # in the middle of the 100-200 ms target window.
-        #
-        # Grounded in EMG literature: Hudgins, Parker, Scott (1993)
-        # document that the deterministic transient phase of muscle
-        # contraction lasts roughly the first 200-300 ms before
-        # settling to steady state. A 150 ms perceived crossfade fits
-        # inside that window.
-        #
-        # Single global value for now. Upgrade 2 will promote this to
-        # a per-gesture lookup driven by GESTURE_CONFIG (small hand
-        # muscles fast, forearm muscles slower).
+        # Crossfade time constant (Upgrade 1). 50 ms -> ~150 ms perceived
+        # transition. Single global value for now; Upgrade 2 promotes
+        # this to a per-gesture lookup.
         self.pattern_tau_s = 0.050
 
-        # Per-channel IIR filter state (x = input history, y = output history).
-        # Shapes white noise into band-limited EMG-like noise. Approximates
-        # a bandpass characteristic without calling scipy.signal.butter
-        # in real time (which would be slow).
+        # Per-channel IIR filter state (unchanged from Upgrade 1).
         self._fs_state = [
             {'x1': 0.0, 'x2': 0.0, 'y1': 0.0, 'y2': 0.0}
             for _ in range(n_channels)
         ]
 
-    def set_gesture(self, gesture_name: str):
-        """Switch the active gesture. The envelope and pattern transition smoothly."""
-        if gesture_name in GESTURE_CONFIG:
-            self.active_gesture = gesture_name
+        # Initialize through the same sampling code path that every
+        # later gesture click will use, then snap current_peak so the
+        # first sample is steady-state Rest, not a zero->Rest ramp.
+        self.set_gesture('Rest')
+        self.current_peak = self.target_peak.copy()
 
-            # ==========================================================
-            # UPGRADE 1: jump target_peak to the new gesture's
-            # pre-multiplied (amplitude * pattern) vector.
-            #
-            # We deliberately do NOT touch current_peak. That is the
-            # whole point of the crossfade:
-            #
-            #   target_peak  = "where we want to be" (jumps instantly)
-            #   current_peak = "where we are"        (walks toward target
-            #                                         inside generate_samples)
-            #
-            # The gap between them IS the transition. If we also reset
-            # current_peak here we would erase the crossfade and be
-            # back to the old hard-switch behavior.
-            #
-            # Reading GESTURE_CONFIG fresh here means a calibration
-            # import that mutates the pattern in-place takes effect on
-            # the next gesture click, identical to the old behavior.
-            # ==========================================================
-            cfg = GESTURE_CONFIG[gesture_name]
-            self.target_peak = cfg['amplitude'] * cfg['pattern']
+    def set_gesture(self, gesture_name: str):
+        """
+        Switch the active gesture and sample a fresh per-channel realization.
+
+        Three things happen here:
+          1. active_gesture is updated for downstream consumers (label, color).
+          2. CALIBRATION REALISM: a fresh realization of the per-channel
+             pattern is drawn from a Gaussian centered on cfg['pattern']
+             with stddev cfg['pattern_std']. This models trial-to-trial
+             variability (10-20% CV per channel; Kapelner et al. 2018,
+             Phinyomark et al. 2012). Sampled ONCE PER CLICK, not per
+             sample, so within-hold RMS stays approximately stationary,
+             which matches real EMG during a sustained contraction.
+          3. UPGRADE 1: target_peak is set to amplitude * realized_pattern.
+             current_peak is NOT touched, so the crossfade kicks in and
+             walks the signal smoothly toward the new realization.
+        """
+        if gesture_name not in GESTURE_CONFIG:
+            return
+
+        self.active_gesture = gesture_name
+        cfg = GESTURE_CONFIG[gesture_name]
+
+        # ==========================================================
+        # CALIBRATION REALISM: per-click realization sampling.
+        #
+        # cfg['pattern_std'] is guaranteed to exist by the module-level
+        # populate loop that runs once at import time. If a calibration
+        # file set it to zeros (or DEFAULT_PATTERN_CV is set to 0), the
+        # randn(8) term contributes nothing and we get deterministic
+        # behavior identical to the pre-realism code path.
+        #
+        # We clip to >= 0 because pattern values represent amplitude
+        # magnitudes. A negative draw has no physical meaning; a real
+        # muscle channel cannot have negative RMS. At 10% CV the
+        # probability of a clip is ~1e-23 in the tail, so this is a
+        # safety net rather than a routine code path.
+        #
+        # .get() with a fallback is defensive against the rare case
+        # where someone mutates GESTURE_CONFIG at runtime without
+        # going through the calibration import path.
+        # ==========================================================
+        std = cfg.get('pattern_std', np.zeros_like(cfg['pattern']))
+        realized_pattern = cfg['pattern'] + std * np.random.randn(self.n_channels)
+        realized_pattern = np.maximum(realized_pattern, 0.0)
+
+        # ==========================================================
+        # UPGRADE 1: jump target_peak only. current_peak is left
+        # alone; the per-sample lerp inside generate_samples() walks
+        # it toward the new target_peak over ~150 ms. The gap
+        # between current_peak and target_peak IS the transition.
+        # ==========================================================
+        self.target_peak = cfg['amplitude'] * realized_pattern
 
     def _shape_noise(self, channel: int, amplitude: float) -> float:
         """
@@ -350,79 +389,34 @@ class EMGSignalGenerator:
         # Target envelope: 0 for rest, 1 for any gesture.
         # env_speed is still a fixed per-sample factor (so it implicitly
         # assumes fs around 1000). Upgrade 2 will fix that. We leave it
-        # alone in this commit so Upgrade 1 is a minimal change.
+        # alone in this commit so the calibration realism edit stays
+        # surgical.
         env_target = 0.0 if is_rest else 1.0
         env_speed  = 0.04 if is_rest else 0.06
 
-        # ==============================================================
-        # UPGRADE 1: per-sample lerp factor for the pattern crossfade.
-        #
-        # Discrete-time exponential smoothing:
-        #     current += alpha * (target - current)
-        # gives an exponential approach to target with time constant
-        #     alpha = 1 - exp(-dt / tau)      (exact form, used here)
-        # where dt = 1 / fs is one sample period.
-        #
-        # WHY THE EXACT FORM (instead of alpha ~= dt/tau)
-        # ----------------------------------------------
-        # The approximation works fine at fs=1000 but drifts at low
-        # rates (fs=250) and high rates (fs=5000). The exact form
-        # keeps the perceived crossfade duration at ~150 ms regardless
-        # of sample rate, which matters because the user can switch
-        # fs live from the UI.
-        #
-        # WHY COMPUTE IT EVERY CALL
-        # -------------------------
-        # self.fs changes when the user picks a new sample rate from
-        # the dropdown. Recomputing here means the crossfade adapts
-        # to the new rate on the very next batch, no extra wiring
-        # required in _change_sample_rate.
-        # ==============================================================
+        # Upgrade 1 lerp factor. Exact exponential-smoothing form so
+        # the crossfade duration is invariant to sample rate, which
+        # the user can change live from the UI.
         alpha_pattern = 1.0 - np.exp(-1.0 / (self.fs * self.pattern_tau_s))
 
         samples = np.zeros((n_samples, self.n_channels))
 
         for i in range(n_samples):
-            # Step the envelope toward its target (smooth exponential approach)
+            # Step the envelope toward its target.
             self.envelope += (env_target - self.envelope) * env_speed
 
-            # ==========================================================
-            # UPGRADE 1: step current_peak toward target_peak.
-            #
-            # ONE vectorized numpy operation over all 8 channels.
-            # target_peak and current_peak are both shape (8,), so
-            # subtraction and elementwise multiply broadcast across
-            # channels without any Python-level inner loop. Cost is
-            # on the order of a microsecond per sample, comfortably
-            # inside the per-buffer budget.
-            #
-            # When the gesture is steady, current_peak converges to
-            # target_peak and this line becomes a no-op (current +=
-            # alpha * 0). The output of the inner loop is then
-            # numerically identical to the old code in steady state,
-            # which means we have not changed anything users rely on
-            # for held gestures, only the behavior during transitions.
-            # ==========================================================
+            # Step current_peak toward target_peak (vectorized over channels).
+            # When the gesture is steady, target_peak == current_peak and
+            # this becomes a no-op (current += alpha * 0). Output is then
+            # numerically identical to the pre-Upgrade-1 code in steady
+            # state. Only transitions differ.
             self.current_peak += (self.target_peak - self.current_peak) * alpha_pattern
 
-            # Compute per-channel amplitude
             for ch in range(self.n_channels):
-                # ======================================================
-                # UPGRADE 1: read peak amplitude from current_peak[ch]
-                # instead of recomputing it from cfg.
-                #
-                # OLD:
-                #   peak_amp = cfg['amplitude'] * cfg['pattern'][ch]
-                #
-                # NEW:
-                #   peak_amp = self.current_peak[ch]
-                #
-                # In steady state these are equal (current_peak has
-                # arrived at target_peak = cfg['amplitude'] * cfg['pattern']).
-                # During a transition, current_peak is somewhere between
-                # the old gesture's vector and the new one, which is
-                # exactly the smooth blend we wanted.
-                # ======================================================
+                # peak_amp is read from current_peak (Upgrade 1).
+                # During a transition, current_peak holds a per-channel
+                # blend between the previous gesture's realization and
+                # the new one, which IS the smooth crossfade.
                 base_amp = GESTURE_CONFIG['Rest']['amplitude']
                 peak_amp = self.current_peak[ch]
                 amp = base_amp + (peak_amp - base_amp) * self.envelope
@@ -430,6 +424,7 @@ class EMGSignalGenerator:
                 samples[i, ch] = self._shape_noise(ch, amp)
 
         return samples, label
+    
 # =============================================================================
 # DATA RECORDER
 # Writes EMG samples to a CSV file in a background thread.
@@ -601,6 +596,14 @@ class EMGSimulatorApp:
 
         self.fs              = DEFAULT_FS  # Current sampling rate (can be changed live)
         self.current_gesture = 'Rest'      # String name of active gesture
+
+
+        # CALIBRATION REALISM: tracks original mV scale when a CSV imported
+        # with raw-mV values is auto-normalized. None means no calibration
+        # imported yet, or imported file was already in [0,1].
+        self.calibration_scale_mV = None
+
+
         self.is_running      = True        # Set to False on window close
         self.total_elapsed   = 0.0         # Total seconds since app started
         self.rec_start_time  = None        # When current recording started
@@ -1710,255 +1713,306 @@ class EMGSimulatorApp:
             )
 
     def _apply_calibration(self, df: 'pd.DataFrame', source_path: str = ""):
-            """
-            Apply a calibration DataFrame to GESTURE_CONFIG.
+        """
+        Apply a calibration DataFrame to GESTURE_CONFIG.
 
-            Deliberately flexible -- handles whatever column naming or
-            structure the colleague sends, as long as it has:
-                - One column identifiable as gesture name
-                - Eight columns identifiable as channel values
-                - Optionally one column for overall amplitude
-            """
-            # ------------------------------------------------------------------
-            # STEP 1: Find the gesture name column
-            # Try common names in order of preference
-            # ------------------------------------------------------------------
-            name_col = None
-            for candidate in ['gesture_name', 'gesture', 'name', 'Gesture',
-                            'Gesture_Name', 'label_name']:
-                if candidate in df.columns:
-                    name_col = candidate
+        Deliberately flexible. The CSV must have:
+            - One column identifiable as gesture name
+            - Eight columns identifiable as channel mean values
+            - Optionally: 8 columns of per-channel standard deviations
+            - Optionally: one column for overall amplitude
+        """
+        # ------------------------------------------------------------------
+        # STEP 1: Find the gesture name column (unchanged)
+        # ------------------------------------------------------------------
+        name_col = None
+        for candidate in ['gesture_name', 'gesture', 'name', 'Gesture',
+                          'Gesture_Name', 'label_name']:
+            if candidate in df.columns:
+                name_col = candidate
+                break
+        if name_col is None:
+            for col in df.columns:
+                if df[col].dtype == object:
+                    name_col = col
                     break
+        if name_col is None:
+            messagebox.showerror(
+                "Import Failed",
+                "Could not find a gesture name column.\n\n"
+                "The file needs at least one column with gesture names like:\n"
+                "  gesture_name, gesture, name\n\n"
+                f"Columns found: {list(df.columns)}"
+            )
+            return
 
-            if name_col is None:
-                # Last resort: use the first string column
-                for col in df.columns:
-                    if df[col].dtype == object:
-                        name_col = col
-                        break
-
-            if name_col is None:
+        # ------------------------------------------------------------------
+        # STEP 2: Find the 8 channel MEAN columns (unchanged)
+        # ------------------------------------------------------------------
+        ch_cols = []
+        strict_patterns = [
+            [f'ch{i+1}_rms'    for i in range(N_CHANNELS)],
+            [f'ch{i+1}'        for i in range(N_CHANNELS)],
+            [f'channel_{i+1}'  for i in range(N_CHANNELS)],
+            [f'Channel{i+1}'   for i in range(N_CHANNELS)],
+            [f'CH{i+1}'        for i in range(N_CHANNELS)],
+            [f'emg{i+1}'       for i in range(N_CHANNELS)],
+            [f'electrode{i+1}' for i in range(N_CHANNELS)],
+            [f'EMG{i+1}'       for i in range(N_CHANNELS)],
+        ]
+        for pattern in strict_patterns:
+            if all(c in df.columns for c in pattern):
+                ch_cols = pattern
+                break
+        if not ch_cols:
+            skip_cols = {
+                name_col, 'gesture_label', 'label', 'ninapro_label',
+                'n_samples', 'samples', 'peak_amplitude', 'amplitude',
+                'peak', 'normalized'
+            }
+            numeric_cols = [
+                c for c in df.columns
+                if c not in skip_cols and pd.api.types.is_numeric_dtype(df[c])
+            ]
+            if len(numeric_cols) >= N_CHANNELS:
+                ch_cols = numeric_cols[:N_CHANNELS]
+            else:
                 messagebox.showerror(
                     "Import Failed",
-                    "Could not find a gesture name column.\n\n"
-                    "The file needs at least one column with gesture names like:\n"
-                    "  gesture_name, gesture, name\n\n"
-                    f"Columns found: {list(df.columns)}"
+                    f"Could not find {N_CHANNELS} numeric channel columns.\n\n"
+                    f"Columns in file: {list(df.columns)}"
                 )
                 return
 
-            # ------------------------------------------------------------------
-            # STEP 2: Find the 8 channel columns
-            # Accept any of these naming patterns:
-            #   ch1_rms, ch1, channel_1, Channel1, CH1, emg1, electrode1
-            # We look for exactly 8 numeric columns that look like channels
-            # ------------------------------------------------------------------
-            ch_cols = []
+        # ------------------------------------------------------------------
+        # NEW STEP 2b: Find the 8 channel STD columns (optional)
+        #
+        # The std columns follow the same naming-convention search as the
+        # mean columns. If we find a full set of 8, we load per-channel
+        # standard deviations from the file. If we don't, we'll derive
+        # them in Step 5 from the means using DEFAULT_PATTERN_CV.
+        #
+        # Accepted naming patterns, in order of preference:
+        #   chN_std, chN_rms_std, chN_sd, channel_N_std, CHN_std
+        #
+        # We deliberately do NOT fall back to "first 8 unused numeric
+        # columns" the way the mean detection does. A wrong std column
+        # is worse than no std column, because it silently corrupts the
+        # variability model. If you can't name it explicitly, we'd
+        # rather derive it.
+        # ------------------------------------------------------------------
+        std_cols = []
+        strict_std_patterns = [
+            [f'ch{i+1}_std'         for i in range(N_CHANNELS)],
+            [f'ch{i+1}_rms_std'     for i in range(N_CHANNELS)],
+            [f'ch{i+1}_sd'          for i in range(N_CHANNELS)],
+            [f'channel_{i+1}_std'   for i in range(N_CHANNELS)],
+            [f'CH{i+1}_std'         for i in range(N_CHANNELS)],
+        ]
+        for pattern in strict_std_patterns:
+            if all(c in df.columns for c in pattern):
+                std_cols = pattern
+                break
 
-            # Try strict patterns first
-            strict_patterns = [
-                [f'ch{i+1}_rms'    for i in range(N_CHANNELS)],
-                [f'ch{i+1}'        for i in range(N_CHANNELS)],
-                [f'channel_{i+1}'  for i in range(N_CHANNELS)],
-                [f'Channel{i+1}'   for i in range(N_CHANNELS)],
-                [f'CH{i+1}'        for i in range(N_CHANNELS)],
-                [f'emg{i+1}'       for i in range(N_CHANNELS)],
-                [f'electrode{i+1}' for i in range(N_CHANNELS)],
-                [f'EMG{i+1}'       for i in range(N_CHANNELS)],
-            ]
+        # ------------------------------------------------------------------
+        # STEP 3: Find the amplitude column (unchanged in spirit, but the
+        #         fallback below is changed)
+        # ------------------------------------------------------------------
+        amp_col = None
+        for candidate in ['peak_amplitude', 'amplitude', 'peak',
+                          'Amplitude', 'Peak_Amplitude']:
+            if candidate in df.columns:
+                amp_col = candidate
+                break
 
-            for pattern in strict_patterns:
-                if all(c in df.columns for c in pattern):
-                    ch_cols = pattern
-                    break
+        # ------------------------------------------------------------------
+        # STEP 4: Normalize to 0-1 range, PRESERVING ABSOLUTE SCALE.
+        #
+        # If the colleague sends raw mV values (anything with max > 1.0),
+        # we divide by the global max to bring everything into [0, 1] so
+        # the simulator's amplitude conventions still hold.
+        #
+        # NEW: we also remember what we divided by, in self.calibration_scale_mV.
+        # That preserves the physical-units context of the data: a downstream
+        # user can multiply simulator output by this number to get back to
+        # approximate mV.
+        #
+        # NEW: if std columns were loaded, they get the SAME normalization.
+        # Pattern and std must stay in the same units. Forgetting to scale
+        # the std would silently inflate the variability model by 100x or more.
+        # ------------------------------------------------------------------
+        ch_data = df[ch_cols].values.astype(np.float64)
+        std_data = df[std_cols].values.astype(np.float64) if std_cols else None
 
-            if not ch_cols:
-                # Fallback: grab all numeric columns that are not known non-channel columns
-                skip_cols = {
-                    name_col, 'gesture_label', 'label', 'ninapro_label',
-                    'n_samples', 'samples', 'peak_amplitude', 'amplitude',
-                    'peak', 'normalized'
-                }
-                numeric_cols = [
-                    c for c in df.columns
-                    if c not in skip_cols
-                    and df[c].dtype in (np.float64, np.float32, np.int64, np.int32)
-                    or (c not in skip_cols and df[c].dtype == object
-                        and df[c].str.match(r'^-?\d+\.?\d*$').all()
-                        if c not in skip_cols and df[c].dtype == object else False)
-                ]
-                # Re-filter cleanly
-                numeric_cols = [
-                    c for c in df.columns
-                    if c not in skip_cols
-                    and pd.api.types.is_numeric_dtype(df[c])
-                ]
+        global_max = ch_data.max()
+        if global_max > 1.0:
+            ch_data = ch_data / global_max
+            if std_data is not None:
+                std_data = std_data / global_max
+            auto_normalized = True
+            self.calibration_scale_mV = float(global_max)
+        else:
+            auto_normalized = False
+            self.calibration_scale_mV = None
 
-                if len(numeric_cols) >= N_CHANNELS:
-                    # Use the first 8 numeric columns
-                    ch_cols = numeric_cols[:N_CHANNELS]
-                elif len(numeric_cols) > 0:
-                    messagebox.showerror(
-                        "Import Failed",
-                        f"Found {len(numeric_cols)} numeric channel columns "
-                        f"but need exactly {N_CHANNELS}.\n\n"
-                        f"Numeric columns found: {numeric_cols}\n\n"
-                        f"Expected column names like:\n"
-                        f"  ch1, ch2 ... ch8\n"
-                        f"  channel_1, channel_2 ... channel_8\n"
-                        f"  CH1, CH2 ... CH8"
-                    )
-                    return
-                else:
-                    messagebox.showerror(
-                        "Import Failed",
-                        f"Could not find any numeric channel columns.\n\n"
-                        f"Columns in file: {list(df.columns)}"
-                    )
-                    return
+        # ------------------------------------------------------------------
+        # STEP 5: Apply to GESTURE_CONFIG
+        # ------------------------------------------------------------------
+        updated = []
+        unmatched = []
+        gesture_lookup = {name.lower().strip(): name for name in GESTURE_CONFIG}
 
-            # ------------------------------------------------------------------
-            # STEP 3: Find the amplitude column (optional)
-            # If not present we compute it as the max channel value per row
-            # ------------------------------------------------------------------
-            amp_col = None
-            for candidate in ['peak_amplitude', 'amplitude', 'peak',
-                            'Amplitude', 'Peak_Amplitude']:
-                if candidate in df.columns:
-                    amp_col = candidate
-                    break
+        for row_idx, row in df.iterrows():
+            raw_name     = str(row[name_col]).strip()
+            lookup_key   = raw_name.lower()
+            matched_name = gesture_lookup.get(lookup_key)
+            if matched_name is None:
+                normalized_key = lookup_key.replace('_', ' ').replace('-', ' ')
+                matched_name   = gesture_lookup.get(normalized_key)
+            if matched_name is None:
+                unmatched.append(raw_name)
+                continue
 
-            # ------------------------------------------------------------------
-            # STEP 4: Normalize channel values to 0-1 range
-            # If the colleague sends raw mV values instead of normalized,
-            # we normalize automatically so the simulator still works correctly
-            # ------------------------------------------------------------------
-            ch_data    = df[ch_cols].values.astype(np.float64)
-            global_max = ch_data.max()
+            pattern = ch_data[row_idx]
 
-            if global_max > 1.0:
-                # Values are not normalized -- do it now
-                ch_data = ch_data / global_max
-                auto_normalized = True
+            # ==========================================================
+            # NEW AMPLITUDE FALLBACK: L2 norm, not max.
+            #
+            # If no explicit amplitude column, we need a single scalar
+            # representing overall contraction strength for this gesture.
+            # The old code used pattern.max() which is dominated by ONE
+            # electrode and ignores all the others.
+            #
+            # np.linalg.norm() (L2 norm) is sum-of-squares-then-sqrt:
+            # it captures total energy across ALL eight channels. A
+            # gesture that lightly activates many muscles ends up with
+            # a similar amplitude to one that strongly activates few,
+            # which matches how perceived contraction strength scales
+            # in practice.
+            # ==========================================================
+            amplitude = (
+                float(row[amp_col])
+                if amp_col is not None
+                else float(np.linalg.norm(pattern))
+            )
+
+            GESTURE_CONFIG[matched_name]['pattern']   = pattern
+            GESTURE_CONFIG[matched_name]['amplitude'] = amplitude
+
+            # ==========================================================
+            # NEW: write pattern_std for this gesture.
+            #
+            # If the file provided std columns, we use them directly.
+            # Otherwise we derive them from the new pattern using
+            # DEFAULT_PATTERN_CV. We always overwrite rather than
+            # preserving the old std, because the old std was scaled
+            # to the OLD pattern and is now stale.
+            # ==========================================================
+            if std_data is not None:
+                GESTURE_CONFIG[matched_name]['pattern_std'] = std_data[row_idx]
             else:
-                auto_normalized = False
+                GESTURE_CONFIG[matched_name]['pattern_std'] = DEFAULT_PATTERN_CV * pattern
 
-            # ------------------------------------------------------------------
-            # STEP 5: Apply to GESTURE_CONFIG
-            # Match rows by gesture name, case-insensitive and strip whitespace
-            # ------------------------------------------------------------------
-            updated = []
-            skipped = []
-            unmatched = []
+            updated.append(matched_name)
 
-            # Build a lowercase lookup of our gesture names
-            gesture_lookup = {
-                name.lower().strip(): name
-                for name in GESTURE_CONFIG.keys()
-            }
+        # ------------------------------------------------------------------
+        # STEP 6: Report results
+        # ------------------------------------------------------------------
+        if not updated:
+            messagebox.showwarning(
+                "Nothing Updated",
+                f"No gesture names in the file matched the simulator.\n\n"
+                f"Simulator expects (case-insensitive):\n"
+                f"  {list(GESTURE_CONFIG.keys())}\n\n"
+                f"File contained:\n"
+                f"  {list(df[name_col])}"
+            )
+            return
 
-            for row_idx, row in df.iterrows():
-                raw_name     = str(row[name_col]).strip()
-                lookup_key   = raw_name.lower()
-                matched_name = gesture_lookup.get(lookup_key)
+        fname = os.path.basename(source_path) if source_path else "file"
 
-                # Also try partial matching
-                # e.g. "wrist_flexion" should match "Wrist Flexion"
-                if matched_name is None:
-                    normalized_key = lookup_key.replace('_', ' ').replace('-', ' ')
-                    matched_name   = gesture_lookup.get(normalized_key)
-
-                if matched_name is None:
-                    unmatched.append(raw_name)
-                    continue
-
-                pattern   = ch_data[row_idx]
-                amplitude = (
-                    float(row[amp_col])
-                    if amp_col is not None
-                    else float(pattern.max())
-                )
-
-                # Rest always gets a small fixed amplitude regardless of file
-               # if matched_name == 'Rest':
-                 #   amplitude = 0.065
-
-                GESTURE_CONFIG[matched_name]['pattern']   = pattern
-                GESTURE_CONFIG[matched_name]['amplitude'] = amplitude
-                updated.append(matched_name)
-
-            # ------------------------------------------------------------------
-            # STEP 6: Report results
-            # ------------------------------------------------------------------
-            if not updated:
-                messagebox.showwarning(
-                    "Nothing Updated",
-                    f"No gesture names in the file matched the simulator.\n\n"
-                    f"Simulator expects (case-insensitive):\n"
-                    f"  {list(GESTURE_CONFIG.keys())}\n\n"
-                    f"File contained:\n"
-                    f"  {list(df[name_col])}"
-                )
-                return
-
-            fname = os.path.basename(source_path) if source_path else "file"
+        # NEW: surface the absolute scale in the live status label so the
+        # user remembers their normalized signal corresponds to a real
+        # peak amplitude they can quote in a report.
+        if self.calibration_scale_mV is not None:
             self.file_info_label.config(
-                text=f"Calibrated: {fname}", fg='#a78bfa'
+                text=f"Calibrated: {fname}  (peak: {self.calibration_scale_mV:.3f} mV)",
+                fg='#a78bfa'
             )
-            self.calibration_btn.config(fg='#34d399')
-            # Console output: print the full calibration table that was applied
-            print("\n" + "=" * 65)
-            print("  CALIBRATION APPLIED")
-            print("=" * 65)
-            print(f"  Source: {source_path or 'unknown'}")
-            print(f"  Auto-normalized: {auto_normalized}")
-            print()
-
-            # Header row
-            header = f"  {'Gesture':<20}" + "".join(f"  CH{i+1:<5}" for i in range(N_CHANNELS)) + "  Amplitude"
-            print(header)
-            print("  " + "-" * (len(header) - 2))
-
-            # One row per updated gesture
-            for row_idx, row in df.iterrows():
-                raw_name     = str(row[name_col]).strip()
-                lookup_key   = raw_name.lower()
-                matched_name = gesture_lookup.get(lookup_key)
-
-                if matched_name is None:
-                    normalized_key = lookup_key.replace('_', ' ').replace('-', ' ')
-                    matched_name   = gesture_lookup.get(normalized_key)
-
-                if matched_name not in updated:
-                    continue
-
-                pattern   = GESTURE_CONFIG[matched_name]['pattern']
-                amplitude = GESTURE_CONFIG[matched_name]['amplitude']
-
-                ch_values = "".join(f"  {v:<7.4f}" for v in pattern)
-                print(f"  {matched_name:<20}{ch_values}  {amplitude:.4f}")
-
-            print("=" * 65 + "\n")           
-
-            notes = []
-            if auto_normalized:
-                notes.append("Values were raw mV -- auto-normalized to 0-1 range.")
-            if unmatched:
-                notes.append(f"Unrecognized gestures skipped: {unmatched}")
-            if len(updated) < len(GESTURE_CONFIG):
-                missing = [g for g in GESTURE_CONFIG if g not in updated]
-                notes.append(
-                    f"Gestures not in file (kept default values): {missing}"
-                )
-
-            messagebox.showinfo(
-                "Calibration Applied",
-                f"Gesture config updated successfully.\n\n"
-                f"Source:   {fname}\n"
-                f"Updated:  {', '.join(updated)}\n"
-                f"Channels: {ch_cols}\n"
-                + ("\nNotes:\n" + "\n".join(f"  - {n}" for n in notes) if notes else "")
+        else:
+            self.file_info_label.config(
+                text=f"Calibrated: {fname}",
+                fg='#a78bfa'
             )
+        self.calibration_btn.config(fg='#34d399')
+
+        # Console output: full calibration table (unchanged)
+        print("\n" + "=" * 65)
+        print("  CALIBRATION APPLIED")
+        print("=" * 65)
+        print(f"  Source:           {source_path or 'unknown'}")
+        print(f"  Auto-normalized:  {auto_normalized}")
+        if self.calibration_scale_mV is not None:
+            print(f"  Original peak:    {self.calibration_scale_mV:.4f} mV")
+        print(f"  Std source:       {'file' if std_data is not None else f'derived ({DEFAULT_PATTERN_CV:.0%} CV)'}")
+        print()
+        header = f"  {'Gesture':<20}" + "".join(f"  CH{i+1:<5}" for i in range(N_CHANNELS)) + "  Amplitude"
+        print(header)
+        print("  " + "-" * (len(header) - 2))
+        for matched_name in updated:
+            pattern   = GESTURE_CONFIG[matched_name]['pattern']
+            amplitude = GESTURE_CONFIG[matched_name]['amplitude']
+            ch_values = "".join(f"  {v:<7.4f}" for v in pattern)
+            print(f"  {matched_name:<20}{ch_values}  {amplitude:.4f}")
+        print("=" * 65 + "\n")
+
+        notes = []
+        if auto_normalized:
+            notes.append(
+                f"Values were raw mV -- auto-normalized to 0-1. "
+                f"Original peak preserved as {self.calibration_scale_mV:.3f} mV."
+            )
+        if std_data is not None:
+            notes.append("Per-channel standard deviations loaded from file.")
+        else:
+            notes.append(f"Standard deviations derived at {DEFAULT_PATTERN_CV:.0%} CV.")
+        if unmatched:
+            notes.append(f"Unrecognized gestures skipped: {unmatched}")
+        if len(updated) < len(GESTURE_CONFIG):
+            missing = [g for g in GESTURE_CONFIG if g not in updated]
+            notes.append(f"Gestures not in file (kept default values): {missing}")
+
+        messagebox.showinfo(
+            "Calibration Applied",
+            f"Gesture config updated successfully.\n\n"
+            f"Source:   {fname}\n"
+            f"Updated:  {', '.join(updated)}\n"
+            f"Channels: {ch_cols}\n"
+            + ("\nNotes:\n" + "\n".join(f"  - {n}" for n in notes) if notes else "")
+        )
+
+        # ==============================================================
+        # NEW: refresh the active gesture so newly-imported values
+        # take effect on the LIVE signal immediately.
+        #
+        # Without this, the user's just-imported calibration sits
+        # dormant until they click a gesture button, because
+        # generate_samples reads from self.target_peak (which was
+        # set by the previous set_gesture call) not from
+        # GESTURE_CONFIG directly.
+        #
+        # Calling set_gesture with the current gesture name does two
+        # useful things:
+        #   1. Refreshes target_peak from the new GESTURE_CONFIG values.
+        #   2. Samples a fresh realization of the variability model
+        #      (so the user can see the new calibration kick in).
+        #
+        # Because current_peak is unchanged, the Upgrade 1 crossfade
+        # then walks the signal smoothly from the old calibration to
+        # the new one over ~150 ms. A nice visible confirmation that
+        # calibration was actually applied.
+        # ==============================================================
+        self.generator.set_gesture(self.current_gesture)
 
     def _toggle_theme(self):
             """Switch between dark and light mode."""
