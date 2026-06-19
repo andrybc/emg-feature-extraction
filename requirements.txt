@@ -1,0 +1,8 @@
+numpy>=1.24
+scipy>=1.10
+matplotlib>=3.6
+pandas>=2.0
+pillow>=10.0
+
+# Build tooling (only needed to package the simulator as a standalone .exe)
+pyinstaller>=6.0

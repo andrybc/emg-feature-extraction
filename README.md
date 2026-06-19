@@ -4,9 +4,49 @@ Real-time 8-channel surface EMG simulator with a modular artifact processing pip
 
 ## Quick start
 
-```bash
-pip install -r requirements.txt
-PYTHONPATH=. python emg_simulator.py
+Open Command Prompt (cmd.exe) in the repo root and run:
+
+```
+setup.bat
+.venv\Scripts\activate.bat
+set PYTHONPATH=.
+python emg_simulator.py
+```
+
+## Setup
+
+This project uses Python 3.12 (see `.python-version`). Required dependencies are pinned in `requirements.txt`.
+
+### First-time setup
+
+```
+setup.bat
+```
+
+### Every session
+
+```
+.venv\Scripts\activate.bat
+set PYTHONPATH=.
+python emg_simulator.py
+```
+
+If you get `ModuleNotFoundError` for numpy, scipy, or matplotlib, you forgot to activate the venv. Re-run the activate line and try again.
+
+### PowerShell users
+
+If you prefer PowerShell over cmd.exe, the activate command is different:
+
+```
+.venv\Scripts\Activate.ps1
+$env:PYTHONPATH = "."
+python emg_simulator.py
+```
+
+You may need to allow script execution once with:
+
+```
+Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
 ```
 
 ## Layout
@@ -31,7 +71,6 @@ To add a new artifact: branch from `main`, subclass `BaseArtifact` in `src/artif
 
 ## Build a standalone executable
 
-```bash
-./build_exe.sh   # Linux/macOS
-build_exe.bat    # Windows
+```
+build_exe.bat
 ```
