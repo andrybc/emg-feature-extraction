@@ -48,7 +48,7 @@ import tempfile
 import shutil
 from tkinter import messagebox, filedialog
 import pandas as pd
-from src.artifacts.sweat import SweatProcessor
+from src.artifacts.base import BaseArtifact
 # =============================================================================
 # PATH RESOLUTION
 # When packaged with PyInstaller (frozen), __file__ does not exist.
@@ -583,16 +583,10 @@ class EMGSimulatorApp:
         self.generator = EMGSignalGenerator()
         self.recorder  = DataRecorder()
 
-        # SWEAT MODULE: instantiate the sweat artifact processor.
-        # Comment out this line (plus the call in _data_loop and the slider in
-        # _build_ui) to disable the sweat module entirely.
-        self.sweat_processor = SweatProcessor(
-            n_channels=N_CHANNELS,
-            fs=DEFAULT_FS,
-            tau_sweat=5.0,
-            seed=42,
-        )
-
+        # Artifact pipeline. Empty on main; each artifact branch appends one
+        # BaseArtifact subclass here. The simulator does not know or care
+        # which artifacts are present, only that they implement the contract.
+        self.artifacts: list[BaseArtifact] = []
 
         self.fs              = DEFAULT_FS  # Current sampling rate (can be changed live)
         self.current_gesture = 'Rest'      # String name of active gesture
@@ -2376,10 +2370,12 @@ class EMGSimulatorApp:
                 samples, label = self.generator.generate_samples(n_samples=BATCH_SIZE)
                 gesture_name   = self.current_gesture
 
-                # SWEAT MODULE: apply sweat artifacts. Returns the buffer unchanged
-                # when the sweat level is at zero, so this is bit-exact no-op when off.
-                samples = self.sweat_processor.process(samples)
-
+                # Apply the artifact pipeline in order. Each artifact takes a
+                # (n_samples, n_channels) buffer and returns one of the same shape.
+                # Empty list on main; populated on artifact branches.
+                for artifact in self.artifacts:
+                    samples = artifact.process(samples, self.fs)
+                    
                 # Push to display buffer (shared with animation callback)
                 with self._buffer_lock:
                     for ch in range(N_CHANNELS):
