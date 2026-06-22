@@ -48,7 +48,8 @@ import tempfile
 import shutil
 from tkinter import messagebox, filedialog
 import pandas as pd
-from src.artifacts.base import BaseArtifact
+from src.artifacts import BaseArtifact
+from src.artifacts.sweat import SweatProcessor
 # =============================================================================
 # PATH RESOLUTION
 # When packaged with PyInstaller (frozen), __file__ does not exist.
@@ -583,10 +584,22 @@ class EMGSimulatorApp:
         self.generator = EMGSignalGenerator()
         self.recorder  = DataRecorder()
 
-        # Artifact pipeline. Empty on main; each artifact branch appends one
-        # BaseArtifact subclass here. The simulator does not know or care
-        # which artifacts are present, only that they implement the contract.
+        # Artifact pipeline. Each branch appends one BaseArtifact subclass.
+        # The simulator does not know or care which artifacts are present,
+        # only that they implement the contract.
         self.artifacts: list[BaseArtifact] = []
+
+        # Sweat artifact. Saved as a named reference because the slider UI
+        # in _build_ui talks to it directly (set_sweat_level). The named
+        # reference and the list entry point to the same object, so
+        # rebuild(fs) on the list element affects this attribute too.
+        self.sweat_processor = SweatProcessor(
+            n_channels=N_CHANNELS,
+            fs=DEFAULT_FS,
+            tau_sweat=5.0,
+            seed=42,
+        )
+        self.artifacts.append(self.sweat_processor)
 
         self.fs              = DEFAULT_FS  # Current sampling rate (can be changed live)
         self.current_gesture = 'Rest'      # String name of active gesture
@@ -1420,7 +1433,7 @@ class EMGSimulatorApp:
         with self._buffer_lock:
             self.fs = new_fs
             self.generator.fs = new_fs
-            
+
             # Notify each artifact that fs changed. Each one decides
             # what to recompute (filter coefficients, time-constant
             # conversions) and what to preserve (user-facing levels).

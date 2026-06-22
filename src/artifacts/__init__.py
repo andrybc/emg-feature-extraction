@@ -10,11 +10,12 @@ To add a new artifact:
     2. Add it to the import list and __all__ below.
     3. Append an instance to self.artifacts in EMGSimulatorApp.__init__.
 
-On main, only the BaseArtifact contract is exported. Concrete artifacts
-live on their own branches (e.g. artifact/sweat) and add themselves
-here when they merge.
+Exports on this branch:
+    - BaseArtifact:   the contract (defined on main)
+    - SweatProcessor: surface-EMG sweat artifact (this branch)
 """
 
 from src.artifacts.base import BaseArtifact
+from src.artifacts.sweat import SweatProcessor
 
-__all__ = ["BaseArtifact"]
+__all__ = ["BaseArtifact", "SweatProcessor"]
