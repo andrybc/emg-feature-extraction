@@ -1420,6 +1420,12 @@ class EMGSimulatorApp:
         with self._buffer_lock:
             self.fs = new_fs
             self.generator.fs = new_fs
+            
+            # Notify each artifact that fs changed. Each one decides
+            # what to recompute (filter coefficients, time-constant
+            # conversions) and what to preserve (user-facing levels).
+            for artifact in self.artifacts:
+                artifact.rebuild(new_fs)
 
             new_display_samples = new_fs * DISPLAY_SECONDS
 

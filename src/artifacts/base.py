@@ -5,10 +5,10 @@ Every artifact in src/artifacts/ models one physical phenomenon that
 contaminates surface EMG (sweat, motion, fatigue, electrode shift,
 powerline interference, etc). Each one is a function from signal to
 signal, optionally with internal state that must be cleared between
-trials.
+trials and rebuilt when the sample rate changes.
 
-To add a new artifact, subclass BaseArtifact, implement process() and
-reset(), and register it in src/artifacts/__init__.py.
+To add a new artifact, subclass BaseArtifact, implement process(),
+reset(), and rebuild(), and register it in src/artifacts/__init__.py.
 """
 
 from abc import ABC, abstractmethod
@@ -53,6 +53,22 @@ class BaseArtifact(ABC):
         Called at the start of a new recording or trial. Stateless
         artifacts should still implement this as a no-op rather than
         omitting it, to make the choice explicit.
+        """
+        ...
+
+    @abstractmethod
+    def rebuild(self, sample_rate: float) -> None:
+        """
+        Recompute fs-dependent internals for a new sample rate.
+
+        Called by the simulator when the user changes fs mid-session.
+        Each artifact decides what to rebuild and what to preserve:
+        filter coefficients and Nyquist-relative cutoffs must be
+        recomputed; user-facing state (slider levels, intensity
+        parameters) should be preserved across the rebuild.
+
+        Stateless artifacts should implement this as a no-op rather
+        than omitting it, to make the choice explicit.
         """
         ...
 
