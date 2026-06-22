@@ -912,65 +912,7 @@ class EMGSimulatorApp:
         )
         fs_menu.pack(side='left')
         
-        
-        # SWEAT MODULE: slider that controls the target sweat level in real time.
-        # -- Sweat control --
-        sweat_frame = tk.LabelFrame(
-            ctrl,
-            text="  Sweat Artifact  ",
-            bg='#0f172a', fg='#334155',
-            font=('Helvetica', 9),
-            bd=1, relief='groove'
-        )
-        sweat_frame.pack(side='left', padx=(0, 10))
 
-        sweat_inner = tk.Frame(sweat_frame, bg='#0f172a')
-        sweat_inner.pack(padx=10, pady=8)
-
-        # Live readout label (updates as slider moves)
-        self.sweat_label = tk.Label(
-            sweat_inner,
-            text="Sweat: 0%",
-            bg='#0f172a', fg='#a78bfa',
-            font=('Courier', 9, 'bold'),
-            width=10, anchor='w'
-        )
-        self.sweat_label.pack(side='left', padx=(0, 8))
-
-        # The slider itself. tk.Scale's `command` fires on every drag step.
-        # from_=0.0, to=1.0 gives the full sweat range; resolution=0.01 gives
-        # 100 discrete steps which is finer than most users can drag.
-        self.sweat_slider = tk.Scale(
-            sweat_inner,
-            from_=0.0, to=1.0, resolution=0.01,
-            orient='horizontal',
-            length=140,
-            showvalue=False,                  # we render the value in our own label
-            command=self._on_sweat_slider_change,
-            bg='#1e293b', fg='#a78bfa',
-            troughcolor='#0a1628',
-            activebackground='#263d5e',
-            highlightthickness=0,
-            relief='flat',
-            sliderrelief='flat',
-            cursor='hand2'
-        )
-        self.sweat_slider.pack(side='left', padx=(0, 6))
-
-        # "Dry" button: snaps the slider back to 0. The sweat processor's
-        # 5-second time constant means the actual decay is still smooth.
-        self.sweat_dry_btn = tk.Button(
-            sweat_inner,
-            text="Dry",
-            command=self._sweat_dry,
-            bg='#1e293b', fg='#34d399',
-            activebackground='#263d5e', activeforeground='#34d399',
-            relief='flat',
-            font=('Helvetica', 9, 'bold'),
-            width=4, cursor='hand2',
-            padx=6, pady=2
-        )
-        self.sweat_dry_btn.pack(side='left')
         
         
         # -- Info panel (right side) --
@@ -1453,21 +1395,9 @@ class EMGSimulatorApp:
                 btn.config(bg='#1e3a5f', relief='sunken')
             else:
                 btn.config(bg='#1e293b', relief='flat')
-    def _on_sweat_slider_change(self, value_str):
-        """
-        Called whenever the user drags the sweat slider.
-        Updates the processor's target level and the live readout label.
-        """
-        value = float(value_str)
-        self.sweat_processor.set_sweat_level(value)
-        pct = int(round(value * 100))
-        self.sweat_label.config(text=f"Sweat: {pct}%")
+ 
 
-    def _sweat_dry(self):
-        """Snap the slider to 0. The 5s time constant still smooths the decay."""
-        self.sweat_slider.set(0.0)
-        # The slider's command callback will fire automatically and update
-        # the processor target and label, so we do not need to do those here.
+
 
     def _change_sample_rate(self, new_fs: int):
         """
@@ -1490,17 +1420,6 @@ class EMGSimulatorApp:
         with self._buffer_lock:
             self.fs = new_fs
             self.generator.fs = new_fs
-            # SWEAT MODULE: rebuild the sweat processor at the new sample rate.
-            # Filter cutoffs and time constants depend on fs, so we re-create the
-            # processor. State is reset, which is the right behavior on rate change.
-            self.sweat_processor = SweatProcessor(
-                n_channels=N_CHANNELS,
-                fs=new_fs,
-                tau_sweat=5.0,
-                seed=42,
-            )
-            # Preserve the current slider value
-            self.sweat_processor.set_sweat_level(self.sweat_slider.get())
 
             new_display_samples = new_fs * DISPLAY_SECONDS
 
@@ -2123,18 +2042,6 @@ class EMGSimulatorApp:
                 pass
             
             
-        # SWEAT MODULE: restyle slider widget
-        if hasattr(self, 'sweat_slider'):
-            self.sweat_slider.configure(
-                bg=t['btn_bg'],
-                troughcolor=t['bg_statusbar'],
-                activebackground=t['btn_active_bg'],
-            )
-        if hasattr(self, 'sweat_dry_btn'):
-            self.sweat_dry_btn.configure(
-                bg=t['btn_bg'],
-                activebackground=t['btn_active_bg'],
-    )
 
         # draw() forces a synchronous full redraw immediately
         # draw_idle() only schedules it, which is not enough here
@@ -2375,7 +2282,7 @@ class EMGSimulatorApp:
                 # Empty list on main; populated on artifact branches.
                 for artifact in self.artifacts:
                     samples = artifact.process(samples, self.fs)
-                    
+
                 # Push to display buffer (shared with animation callback)
                 with self._buffer_lock:
                     for ch in range(N_CHANNELS):
