@@ -924,8 +924,67 @@ class EMGSimulatorApp:
             font=('Helvetica', 10)
         )
         fs_menu.pack(side='left')
-        
 
+        # -- Sweat control --
+        # Slider that controls the SweatProcessor's target sweat level.
+        # The processor's 5-second time constant smooths the actual level
+        # toward this target, so dragging is felt as a gradual onset.
+        sweat_frame = tk.LabelFrame(
+            ctrl,
+            text="  Sweat Artifact  ",
+            bg='#0f172a', fg='#334155',
+            font=('Helvetica', 9),
+            bd=1, relief='groove'
+        )
+        sweat_frame.pack(side='left', padx=(0, 10))
+
+        sweat_inner = tk.Frame(sweat_frame, bg='#0f172a')
+        sweat_inner.pack(padx=10, pady=8)
+
+        # Live readout label (updates as slider moves)
+        self.sweat_label = tk.Label(
+            sweat_inner,
+            text="Sweat: 0%",
+            bg='#0f172a', fg='#a78bfa',
+            font=('Courier', 9, 'bold'),
+            width=10, anchor='w'
+        )
+        self.sweat_label.pack(side='left', padx=(0, 8))
+
+        # The slider itself. tk.Scale's command fires on every drag step.
+        # from_=0.0, to=1.0 gives the full sweat range; resolution=0.01
+        # gives 100 discrete steps, finer than most users can drag.
+        self.sweat_slider = tk.Scale(
+            sweat_inner,
+            from_=0.0, to=1.0, resolution=0.01,
+            orient='horizontal',
+            length=140,
+            showvalue=False,
+            command=self._on_sweat_slider_change,
+            bg='#1e293b', fg='#a78bfa',
+            troughcolor='#0a1628',
+            activebackground='#263d5e',
+            highlightthickness=0,
+            relief='flat',
+            sliderrelief='flat',
+            cursor='hand2'
+        )
+        self.sweat_slider.pack(side='left', padx=(0, 6))
+
+        # "Dry" button: snaps the slider back to 0. The processor's
+        # 5-second time constant still smooths the actual decay.
+        self.sweat_dry_btn = tk.Button(
+            sweat_inner,
+            text="Dry",
+            command=self._sweat_dry,
+            bg='#1e293b', fg='#34d399',
+            activebackground='#263d5e', activeforeground='#34d399',
+            relief='flat',
+            font=('Helvetica', 9, 'bold'),
+            width=4, cursor='hand2',
+            padx=6, pady=2
+        )
+        self.sweat_dry_btn.pack(side='left')
         
         
         # -- Info panel (right side) --
@@ -1409,6 +1468,28 @@ class EMGSimulatorApp:
             else:
                 btn.config(bg='#1e293b', relief='flat')
  
+    
+    def _on_sweat_slider_change(self, value_str):
+        """
+        Called whenever the user drags the sweat slider.
+        Updates the SweatProcessor's target level and the live readout.
+
+        tk.Scale's command callback always passes the new value as a
+        string, so we cast to float here.
+        """
+        value = float(value_str)
+        self.sweat_processor.set_sweat_level(value)
+        pct = int(round(value * 100))
+        self.sweat_label.config(text=f"Sweat: {pct}%")
+
+    def _sweat_dry(self):
+        """
+        Snap the slider to 0. The slider's command callback fires
+        automatically and updates the processor target and label, so
+        nothing else needs to happen here. The processor's 5-second
+        time constant still smooths the actual decay.
+        """
+        self.sweat_slider.set(0.0)
 
 
 
@@ -2054,6 +2135,18 @@ class EMGSimulatorApp:
                 fg=t['fg_secondary'],
                 activebackground=t['btn_active_bg']
             )
+        
+        # Sweat slider and Dry button restyle
+        self.sweat_slider.configure(
+            bg=t['btn_bg'],
+            troughcolor=t['bg_statusbar'],
+            activebackground=t['btn_active_bg'],
+        )
+        self.sweat_dry_btn.configure(
+            bg=t['btn_bg'],
+            activebackground=t['btn_active_bg'],
+        )
+        
         if hasattr(self, 'anim'):
             try:
                 self.anim._blit_cache.clear()
