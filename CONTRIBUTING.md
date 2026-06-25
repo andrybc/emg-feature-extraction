@@ -249,16 +249,6 @@ With your UI in place, exercise the full path:
 
 If any of these break, the symptom maps to a specific touchpoint: a missing pass-through guard, a `rebuild()` that resets user state, or a missing entry in `_apply_theme`.
 
-## Common pitfalls
-
-**Looping over channels in Python.** Your `process()` runs hundreds of times per second. Use NumPy broadcasting, not a `for` loop over channels.
-
-**Resetting user-facing state in `rebuild()`.** Rate changes should feel seamless from the user's perspective. If your slider snaps back to zero on a rate change, you reset something you should not have.
-
-**Defensive `hasattr` guards.** You may see them in older code. Do not add new ones. On your branch your widgets exist; reference them directly.
-
-**Forgetting the pass-through guard.** Your artifact runs even when the user has not turned it on. The off-state must be cheap.
-
 ## Where to look when stuck
 
 - `src/artifacts/base.py`: the contract.
