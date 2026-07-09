@@ -75,6 +75,7 @@ class SweatProcessor(BaseArtifact):
             drift_scale: float = 0.5,
             imbalance_range: tuple[float, float] = (0.0, 0.3),
             rms_tau: float = 0.2,
+            powerline_harmonic_weights: tuple[float, ...] = (1.0, 0.3, 0.1, 0.03),
         ):
             # ----- Store fs-independent config -----
             self.n_channels       = n_channels
@@ -85,6 +86,8 @@ class SweatProcessor(BaseArtifact):
             self.max_attenuation  = float(max_attenuation)
             self.drift_scale      = float(drift_scale)
             self.rms_tau          = float(rms_tau)
+            self._harmonic_weights = np.asarray(powerline_harmonic_weights, dtype=np.float64)
+
 
             # ----- Seeded RNG (independent of np.random global state) -----
             self._rng = np.random.default_rng(seed)
@@ -273,42 +276,57 @@ class SweatProcessor(BaseArtifact):
         
         # --- Mechanism 4: powerline pickup from CMRR loss (Webster 1984; Xu et al. 2020) ---
         # Sweat creates asymmetric electrode-skin impedance. Asymmetric impedance
-        # breaks the differential amplifier's common-mode rejection, so 60 Hz
-        # (or 50 Hz in Europe) from the local wall-power environment leaks into
-        # the recording as a differential signal. Amplitude per channel scales
-        # with that channel's fixed imbalance factor, the current sweat level,
-        # and the rolling signal RMS.
+        # breaks the differential amplifier's common-mode rejection, so powerline
+        # frequency (60 Hz in NA, 50 Hz in EU) from the local wall-power
+        # environment leaks into the recording as a differential signal.
+        #
+        # Real powerline pickup includes harmonics from grid distortion and
+        # non-linear coupling at the skin-electrode interface (Mewett et al.
+        # 2001). Modeled here as a sum of sinusoids at integer multiples of the
+        # fundamental, with amplitude weights decaying per harmonic order.
+        # Harmonics are phase-locked to the fundamental (k-th harmonic phase =
+        # k * fundamental phase) because they come from the same periodic
+        # distortion at the source.
 
-        # Step 1: vectorized sine values across the emg.
-        # Phase advances continuously across emgs via _powerline_phase.
+        # Step 1: vectorized time indices for this buffer.
         t_indices = np.arange(n_samples)                                          # shape (T,)
-        phase_per_sample = (
+
+        # Step 2: fundamental phase across the buffer. Continuous with previous
+        # buffer via _powerline_phase.
+        fundamental_phase = (
             self._powerline_phase
             + 2.0 * np.pi * self.powerline_freq * t_indices / self.fs
-        )
-        sine_values = np.sin(phase_per_sample)                                    # shape (T,)
+        )                                                                         # shape (T,)
 
-        # Step 2: update phase for next emg call. Modulo keeps it bounded.
+        # Step 3: build the harmonic stack. Each harmonic k contributes
+        # weight_k * sin(k * fundamental_phase). Harmonics whose frequency
+        # exceeds 0.45 * Nyquist are skipped to avoid aliasing at low fs.
+        nyq = 0.5 * self.fs
+        max_safe_freq = 0.45 * nyq
+        sine_values = np.zeros(n_samples, dtype=np.float64)                       # shape (T,)
+        for k, weight in enumerate(self._harmonic_weights, start=1):
+            if k * self.powerline_freq >= max_safe_freq:
+                continue
+            sine_values += weight * np.sin(k * fundamental_phase)
+
+        # Step 4: update fundamental phase for next buffer. Modulo keeps it
+        # bounded. Only the fundamental phase is tracked; harmonic phases
+        # derive from it.
         self._powerline_phase = (
             self._powerline_phase
             + 2.0 * np.pi * self.powerline_freq * n_samples / self.fs
         ) % (2.0 * np.pi)
 
-        # Step 3: per-channel amplitude. Imbalance is fixed per channel; sweat
+        # Step 5: per-channel amplitude. Imbalance is fixed per channel; sweat
         # and RMS scale dynamically. Shape (C,).
         powerline_amplitude = (
             self._per_channel_imbalance * s * self._running_rms
         )
 
-        # Step 4: outer-product-style broadcast: (T,) × (C,) -> (T, C)
-        # sine_values[:, None] has shape (T, 1); powerline_amplitude[None, :] has shape (1, C).
-        # The product is (T, C), where every row is the same sine value times the
-        # per-channel amplitude vector.
+        # Step 6: outer-product broadcast: (T,) x (C,) -> (T, C).
         powerline_signal = sine_values[:, None] * powerline_amplitude[None, :]    # shape (T, C)
 
-        out = out + powerline_signal        
-        
-        
+        out = out + powerline_signal
 
         return out
 
