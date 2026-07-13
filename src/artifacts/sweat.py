@@ -104,24 +104,30 @@ class SweatProcessor(BaseArtifact):
             self._rng = np.random.default_rng(seed)
 
             # ----- Per-channel fixed factors (set once, never change) -----
-            # Modulation: normal(1.0, 0.15) clipped to [0.6, 1.4]
-            raw_mod = self._rng.normal(loc=1.0, scale=0.15, size=n_channels)
-            self._per_channel_modulation = np.clip(raw_mod, 0.6, 1.4).astype(np.float64)
-
-            # Imbalance: uniform on the requested range
+            # Imbalance: uniform on the requested range. Represents physical
+            # electrode impedance mismatch, independent of sweat level.
             lo, hi = imbalance_range
             self._per_channel_imbalance = self._rng.uniform(
                 low=lo, high=hi, size=n_channels
             ).astype(np.float64)
 
             # ----- User-facing state (preserved across rebuild) -----
-            self._target_sweat_level  = 0.0
-            self._current_sweat_level = 0.0
+            # Per-channel interface degradation state, one value per channel.
+            # The user sets a target vector via set_channel_sweat_levels()
+            # (or set_sweat_level() for uniform mode). Current state advances
+            # toward target via first-order dynamics in _update_smoothed_level().
+            self._target_interface_state  = np.zeros(n_channels, dtype=np.float64)
+            self._current_interface_state = np.zeros(n_channels, dtype=np.float64)
 
             # ----- Other runtime state (also preserved across rebuild) -----
             self._baseline_drift_value = np.zeros(n_channels, dtype=np.float64)
             self._powerline_phase = 0.0
             self._running_rms: np.ndarray | None = None
+            self._lp_cache: dict = {}
+            # Per-channel lowpass filter delay-line state.
+            # List of length n_channels; each entry is either None (uninitialized)
+            # or a numpy array of shape (filter_order,) with the current zi.
+            self._lp_zi_per_channel = [None] * n_channels
 
             # ----- fs-dependent setup -----
             # rebuild() stores self.fs, designs the drift-noise filter, and
@@ -132,21 +138,51 @@ class SweatProcessor(BaseArtifact):
     # Public API
     # ------------------------------------------------------------------
 
+    def set_channel_sweat_levels(self, targets) -> None:
+        """
+        Set per-channel target sweat levels.
+
+        Parameters
+        ----------
+        targets : array-like of length n_channels
+            Target sweat level for each channel. Each value clipped to [0, 1].
+            The current interface state on each channel will advance toward
+            its target via first-order dynamics (tau_sweat), or snap
+            immediately when tau_sweat=0.
+        """
+        arr = np.asarray(targets, dtype=np.float64)
+        if arr.shape != (self.n_channels,):
+            raise ValueError(
+                f"targets must have shape ({self.n_channels},), "
+                f"got {arr.shape}"
+            )
+        self._target_interface_state = np.clip(arr, 0.0, 1.0)
+
     def set_sweat_level(self, target: float) -> None:
-        """Set the target sweat level. Will be clipped to [0, 1]."""
-        self._target_sweat_level = float(np.clip(target, 0.0, 1.0))
+        """
+        Set a uniform target sweat level across all channels.
+
+        Convenience method for global-mode UI. Equivalent to
+        set_channel_sweat_levels([target] * n_channels).
+
+        Parameters
+        ----------
+        target : float
+            Target sweat level, clipped to [0, 1]. Applied uniformly
+            to all channels.
+        """
+        uniform = np.full(self.n_channels, float(target), dtype=np.float64)
+        self.set_channel_sweat_levels(uniform)
 
     def reset(self) -> None:
         """
-        Clear all runtime state. Per-channel modulation and imbalance
-        are NOT reset (those are deterministic from the seed).
+        Clear all runtime state. Per-channel imbalance is NOT reset
+        (deterministic from the seed).
         """
-        self._target_sweat_level  = 0.0
-        self._current_sweat_level = 0.0
-        self._lp_zi               = None
-        self._lp_last_cutoff      = None
-        self._lp_b                = None
-        self._lp_a                = None
+        self._target_interface_state[:]  = 0.0
+        self._current_interface_state[:] = 0.0
+        self._lp_cache = {}
+        self._lp_zi_per_channel = [None] * self.n_channels
         self._baseline_drift_value[:] = 0.0
         self._powerline_phase     = 0.0
         self._running_rms         = None
@@ -171,20 +207,13 @@ class SweatProcessor(BaseArtifact):
 
             # Invalidate cached lowpass coefficients; the next process() call
             # will redesign them in _get_lowpass_coeffs() at the new Nyquist.
-            self._lp_b = None
-            self._lp_a = None
-            self._lp_last_cutoff = None
-
-            # Reset filter delay-line state for both filters. The old zi was
-            # designed for the old coefficients; using it with the new ones
-            # would produce a startup transient. We let the next process()
-            # call re-seed via lfilter_zi.
-            self._lp_zi = None
+            self._lp_cache = {}
+            self._lp_zi_per_channel = [None] * self.n_channels
             self._drift_noise_zi = None
 
-            # NOT touched: _target_sweat_level, _current_sweat_level,
+            # NOT touched: _target_interface_state, _current_interface_state,
             # _running_rms, _baseline_drift_value, _powerline_phase,
-            # _per_channel_modulation, _per_channel_imbalance.
+            # _per_channel_imbalance.
 
     def process(self, emg: np.ndarray, sample_rate: float) -> np.ndarray:
         """
@@ -211,16 +240,21 @@ class SweatProcessor(BaseArtifact):
 
         # ----- 1. Advance the smoothed sweat level toward the target -----
         self._update_smoothed_level(n_samples)
-
-        # ----- 2. Bit-exact pass-through (Q4 option A) -----
-        # If both target and current are at/near zero, snap current to 0
-        # and return the input unchanged. Decay tail below 1e-6 is invisible.
-        if self._target_sweat_level == 0.0 and self._current_sweat_level < 0.01:
-            self._current_sweat_level = 0.0
+        
+        # ----- 2. Bit-exact pass-through -----
+        # If every channel's target and current are at/near zero, snap
+        # current to 0 and return the input unchanged. Decay tail below
+        # 1e-6 is invisible. If any channel has nonzero sweat, the
+        # pipeline runs on all channels (we don't split the buffer).
+        if (np.all(self._target_interface_state == 0.0)
+                and np.all(self._current_interface_state < 0.01)):
+            self._current_interface_state[:] = 0.0
             return emg
-
-        # ----- 3. Effective per-channel sweat for this emg -----
-        s = self._current_sweat_level * self._per_channel_modulation  # (C,)
+        
+        # ----- 3. Effective per-channel sweat for this buffer -----
+        # After the Stage 3A refactor, the per-channel state IS the
+        # effective sweat vector. No global-times-modulation step needed.
+        s = self._current_interface_state  # shape (C,)
 
         # ----- 4. Update rolling RMS so additive mechanisms can use it -----
         self._update_running_rms(emg, n_samples)
@@ -237,27 +271,36 @@ class SweatProcessor(BaseArtifact):
         sigmoid_raw            = 1.0 / (1.0 + np.exp(-self._sigmoid_k * (s - 0.5)))   # shape (C,)
         sigmoid_normalized     = (sigmoid_raw - self._sig_at_zero) / self._sig_range  # shape (C,)
         attenuation_multiplier = 1.0 - self.max_attenuation * sigmoid_normalized      # shape (C,)
-        out = emg * attenuation_multiplier                                            # shape (T, C)                      # shape (T, C)
+        out = emg * attenuation_multiplier                                            # shape (T, C)                   
 
 
         # --- Mechanism 2: stateful low-pass filtering (De Luca 1997; ---
         # --- Abdoli-Eramaki et al. 2012) ---
-        # Cutoff slides from 400 Hz (dry, near-transparent) down to 150 Hz
-        # (wet, attenuates the upper EMG band). Filter state is preserved
-        # across emgs via lfilter_zi so there are no boundary discontinuities.
-        b, a = self._get_lowpass_coeffs()
+        # Cutoff slides from dry_cutoff_hz (dry, near-transparent) down to
+        # wet_cutoff_hz (wet, attenuates the upper EMG band). PER-CHANNEL
+        # cutoff after Stage 3A: each channel's cutoff is driven by its
+        # own interface state, so clean channels see near-transparent
+        # filtering while sweaty channels see aggressive filtering.
+        #
+        # Filter state is preserved per-channel across buffers via
+        # lfilter_zi so there are no boundary discontinuities. Coefficient
+        # design is cached in _lp_cache keyed by quantized cutoff, so
+        # channels sharing (quantized) sweat level share designs.
+        filtered = np.empty_like(out)
+        for ch in range(self.n_channels):
+            b_ch, a_ch = self._get_lowpass_coeffs_for_channel(s[ch])
 
-        if self._lp_zi is None:
-            # First call after construction or reset: seed the filter state
-            # using lfilter_zi so the filter starts in a steady state for
-            # the current input level. Avoids a startup transient.
-            # zi shape needs to be (filter_order, n_channels) for axis=0 filtering.
-            zi_single = dsp.lfilter_zi(b, a)                      # shape (4,)
-            # Scale each channel's initial state by that channel's first sample.
-            # emg[0] has shape (C,); zi_single[:, None] has shape (4, 1).
-            self._lp_zi = zi_single[:, None] * emg[0][None, :]  # shape (4, C)
+            if self._lp_zi_per_channel[ch] is None:
+                # First call: seed filter state to steady state for this
+                # channel's first sample.
+                zi_single = dsp.lfilter_zi(b_ch, a_ch)              # shape (4,)
+                self._lp_zi_per_channel[ch] = zi_single * out[0, ch]  # shape (4,)
 
-        out, self._lp_zi = dsp.lfilter(b, a, out, axis=0, zi=self._lp_zi)
+            filtered[:, ch], self._lp_zi_per_channel[ch] = dsp.lfilter(
+                b_ch, a_ch, out[:, ch], zi=self._lp_zi_per_channel[ch]
+            )
+
+        out = filtered
 
 
         # --- Mechanism 3: baseline drift (De Luca et al. 2010) ---
@@ -315,9 +358,9 @@ class SweatProcessor(BaseArtifact):
 
         # Step 3: build the harmonic stack. Each harmonic k contributes
         # weight_k * sin(k * fundamental_phase). Harmonics whose frequency
-        # exceeds 0.45 * Nyquist are skipped to avoid aliasing at low fs.
+        # exceeds 0.95 * Nyquist are skipped to avoid aliasing at low fs.
         nyq = 0.5 * self.fs
-        max_safe_freq = 0.45 * nyq
+        max_safe_freq = 0.95 * nyq
         sine_values = np.zeros(n_samples, dtype=np.float64)                       # shape (T,)
         for k, weight in enumerate(self._harmonic_weights, start=1):
             if k * self.powerline_freq >= max_safe_freq:
@@ -351,27 +394,37 @@ class SweatProcessor(BaseArtifact):
 
     def _update_smoothed_level(self, n_samples: int) -> None:
         """
-        Move _current_sweat_level toward _target_sweat_level using a
-        first-order step. dt is the duration of this buffer.
+        Advance per-channel interface state toward per-channel target
+        via first-order dynamics. Asymmetric tau: slow buildup
+        (tau_sweat, default 5s), fast decay (tau_sweat * 0.2, default 1s).
+
+        Each channel is updated independently. Channels whose target
+        is 0 use the fast-decay tau; channels whose target is nonzero
+        use the slow-buildup tau. This means dropping the sweat on one
+        channel to zero decays it quickly on that channel alone.
         """
-        # Offline mode: snap immediately. Must come BEFORE effective_tau
-        # is computed, otherwise tau_sweat=0 propagates into a divide-by-zero.
+        # Offline mode: snap immediately. Must come BEFORE tau math,
+        # otherwise tau_sweat=0 propagates into a divide-by-zero.
         if self.tau_sweat <= 0.0:
-            self._current_sweat_level = self._target_sweat_level
+            self._current_interface_state[:] = self._target_interface_state
             return
 
-        # Use a faster time constant when decaying toward zero. This makes
-        # the "Dry" button feel responsive without sacrificing the slow buildup.
-        if self._target_sweat_level == 0.0:
-            effective_tau = self.tau_sweat * 0.2   # 1-second decay
-        else:
-            effective_tau = self.tau_sweat
-
-        dt    = n_samples / self.fs
-        alpha = 1.0 - np.exp(-dt / effective_tau)
-        self._current_sweat_level += alpha * (
-            self._target_sweat_level - self._current_sweat_level
+        # Per-channel effective tau vector.
+        # Channels with target == 0 get the fast-decay tau; others get slow.
+        slow_tau  = self.tau_sweat
+        fast_tau  = self.tau_sweat * 0.2
+        tau_vec   = np.where(
+            self._target_interface_state == 0.0,
+            fast_tau,
+            slow_tau,
         )
+
+        dt        = n_samples / self.fs
+        alpha_vec = 1.0 - np.exp(-dt / tau_vec)          # shape (C,)
+        self._current_interface_state += alpha_vec * (
+            self._target_interface_state - self._current_interface_state
+        )
+        
         
     def _update_running_rms(self, buffer: np.ndarray, n_samples: int) -> None:
         """
@@ -402,36 +455,36 @@ class SweatProcessor(BaseArtifact):
             N=2, Wn=cutoff / nyq, btype='low'
         )
     
-    def _get_lowpass_coeffs(self):
+    def _get_lowpass_coeffs_for_channel(self, s_channel: float):
         """
-        Return cached Butterworth low-pass coefficients (b, a), redesigning
-        only when the quantized cutoff changes. Cutoff slides linearly from
-        dry_cutoff_hz at sweat=0 down to wet_cutoff_hz at sweat=1.
+        Return cached Butterworth low-pass coefficients (b, a) for a
+        single channel's current interface state. Cutoff slides linearly
+        from dry_cutoff_hz at s=0 down to wet_cutoff_hz at s=1.
+
+        Quantized to nearest 5 Hz. Coefficient design is cached in
+        self._lp_cache keyed by quantized cutoff, so channels with the
+        same (quantized) sweat level share designs. In global mode all
+        8 channels hit the same cache entry.
         """
-        # Step 1: linear interpolation between dry and wet cutoffs.
-        s_scalar = self._current_sweat_level
+        # Step 1: linear interpolation between dry and wet cutoffs for this channel.
         cutoff_hz = (
             self.dry_cutoff_hz
-            + (self.wet_cutoff_hz - self.dry_cutoff_hz) * s_scalar
+            + (self.wet_cutoff_hz - self.dry_cutoff_hz) * float(s_channel)
         )
 
-        # Step 2: quantize to nearest 5 Hz to enable design caching.
+        # Step 2: quantize to nearest 5 Hz for caching.
         quantized = round(cutoff_hz / 5.0) * 5.0
 
-        # Step 3: clamp cutoff to be safely below Nyquist. At very low sample
-        # rates (e.g. 250 Hz, Nyquist 125 Hz), the dry cutoff of 400 Hz would
-        # exceed Nyquist and crash butter(). Clamp to 0.45 * Nyquist as a safe
-        # upper bound; 0.45 gives some margin from the hard Nyquist limit.
+        # Step 3: clamp cutoff safely below Nyquist and above 1 Hz.
         nyq = 0.5 * self.fs
-        max_safe_cutoff = 0.45 * nyq                    # 45% of fs/2
-        min_safe_cutoff = 1.0                           # 1 Hz floor
+        max_safe_cutoff = 0.95 * nyq
+        min_safe_cutoff = 1.0
         quantized = max(min_safe_cutoff, min(quantized, max_safe_cutoff))
 
-        # Step 4: rebuild only on quantized-cutoff change.
-        if quantized != self._lp_last_cutoff:
-            self._lp_b, self._lp_a = dsp.butter(
-                N=4, Wn=quantized / nyq, btype='low'
-            )
-            self._lp_last_cutoff = quantized
+        # Step 4: cache lookup.
+        if quantized in self._lp_cache:
+            return self._lp_cache[quantized]
 
-        return self._lp_b, self._lp_a
+        b, a = dsp.butter(N=4, Wn=quantized / nyq, btype='low')
+        self._lp_cache[quantized] = (b, a)
+        return b, a
