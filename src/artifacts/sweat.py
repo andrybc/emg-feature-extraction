@@ -75,6 +75,7 @@ class SweatProcessor(BaseArtifact):
             drift_scale: float = 0.5,
             imbalance_range: tuple[float, float] = (0.0, 0.3),
             rms_tau: float = 0.2,
+            attenuation_steepness: float = 8.0,
             powerline_harmonic_weights: tuple[float, ...] = (1.0, 0.3, 0.1, 0.03),
         ):
             # ----- Store fs-independent config -----
@@ -86,6 +87,16 @@ class SweatProcessor(BaseArtifact):
             self.max_attenuation  = float(max_attenuation)
             self.drift_scale      = float(drift_scale)
             self.rms_tau          = float(rms_tau)
+            self._sigmoid_k       = float(attenuation_steepness)
+            # Precomputed sigmoid values at the endpoints, used to rescale
+            # the sigmoid so it hits exactly 0 at s=0 and exactly 1 at s=1.
+            # This preserves the pass-through guard semantics (no attenuation
+            # when sweat is off) and makes max_attenuation an accurate label
+            # for the attenuation at full sweat.
+            sig_at_zero            = 1.0 / (1.0 + np.exp( self._sigmoid_k * 0.5))
+            sig_at_one             = 1.0 / (1.0 + np.exp(-self._sigmoid_k * 0.5))
+            self._sig_at_zero      = float(sig_at_zero)
+            self._sig_range        = float(sig_at_one - sig_at_zero)
             self._harmonic_weights = np.asarray(powerline_harmonic_weights, dtype=np.float64)
 
 
@@ -218,11 +229,15 @@ class SweatProcessor(BaseArtifact):
         out = emg  # placeholder; will be reassigned by mechanisms below
 
         # --- Mechanism 1: amplitude attenuation (Abdoli-Eramaki et al. 2012) ---
-        # Linear amplitude loss proportional to per-channel sweat level. At
-        # sweat=1 each channel drops by max_attenuation (default 30%). The
-        # multiplier has shape (C,) and broadcasts across the (T, C) emg.
-        attenuation_multiplier = 1.0 - self.max_attenuation * s         # shape (C,)
-        out = emg * attenuation_multiplier                           # shape (T, C)
+        # Sigmoid amplitude loss vs per-channel sweat level. Real EMG
+        # amplitude vs sweat shows a flat-then-drop-then-plateau shape
+        # rather than a straight-line drop; the sigmoid captures that.
+        # Normalized so the multiplier equals 1.0 at s=0 (preserving the
+        # pass-through guard) and (1 - max_attenuation) at s=1.
+        sigmoid_raw            = 1.0 / (1.0 + np.exp(-self._sigmoid_k * (s - 0.5)))   # shape (C,)
+        sigmoid_normalized     = (sigmoid_raw - self._sig_at_zero) / self._sig_range  # shape (C,)
+        attenuation_multiplier = 1.0 - self.max_attenuation * sigmoid_normalized      # shape (C,)
+        out = emg * attenuation_multiplier                                            # shape (T, C)                      # shape (T, C)
 
 
         # --- Mechanism 2: stateful low-pass filtering (De Luca 1997; ---
