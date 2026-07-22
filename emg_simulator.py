@@ -573,7 +573,7 @@ class EMGSimulatorApp:
     - Tkinter event loop (main thread): handles button clicks
     """
 
-    def __init__(self, root: tk.Tk):
+    def __init__(self, root: tk.Tk, sweat_steepness: float = 8.0):
         self.root = root
         self.root.title("EMG Armband Simulator")
         self.root.configure(bg='#0f172a')
@@ -597,6 +597,7 @@ class EMGSimulatorApp:
             n_channels=N_CHANNELS,
             fs=DEFAULT_FS,
             tau_sweat=5.0,
+            attenuation_steepness=sweat_steepness,
             seed=42,
         )
         self.artifacts.append(self.sweat_processor)
@@ -985,6 +986,26 @@ class EMGSimulatorApp:
             padx=6, pady=2
         )
         self.sweat_dry_btn.pack(side='left')
+
+        # "Per-channel..." button opens the secondary per-channel window
+        # (forearm diagram + 8 sliders + group nudge). While that window
+        # is open it drives the processor via set_channel_sweat_levels;
+        # closing it hands control back to this global slider.
+        self.sweat_perchan_btn = tk.Button(
+            sweat_inner,
+            text="Per-channel...",
+            command=self._open_perchannel_window,
+            bg='#1e293b', fg='#a78bfa',
+            activebackground='#263d5e', activeforeground='#a78bfa',
+            relief='flat',
+            font=('Helvetica', 9, 'bold'),
+            cursor='hand2',
+            padx=6, pady=2
+        )
+        self.sweat_perchan_btn.pack(side='left', padx=(6, 0))
+
+        # Reference to the per-channel window (None when closed).
+        self._perchan_window = None
         
         
         # -- Info panel (right side) --
@@ -1471,16 +1492,23 @@ class EMGSimulatorApp:
     
     def _on_sweat_slider_change(self, value_str):
         """
-        Called whenever the user drags the sweat slider.
+        Called whenever the user drags the global sweat slider.
         Updates the SweatProcessor's target level and the live readout.
 
-        tk.Scale's command callback always passes the new value as a
-        string, so we cast to float here.
+        If the per-channel window is open, the global slider is inactive
+        (the per-channel window owns the processor targets). We still
+        update the label so the readout stays consistent, but we don't
+        push to the processor.
         """
         value = float(value_str)
-        self.sweat_processor.set_sweat_level(value)
         pct = int(round(value * 100))
         self.sweat_label.config(text=f"Sweat: {pct}%")
+
+        if self._perchan_window is not None:
+            # Per-channel window owns the targets; don't override.
+            return
+
+        self.sweat_processor.set_sweat_level(value)
 
     def _sweat_dry(self):
         """
@@ -1490,6 +1518,231 @@ class EMGSimulatorApp:
         time constant still smooths the actual decay.
         """
         self.sweat_slider.set(0.0)
+
+    # ------------------------------------------------------------------
+    # Per-channel sweat window (Stage 3B)
+    # ------------------------------------------------------------------
+
+    def _open_perchannel_window(self):
+        """
+        Open the secondary per-channel sweat window. Seeds the 8 base
+        sliders from the current global slider value and the group nudge
+        at 0. If already open, just raise it.
+        """
+        if self._perchan_window is not None:
+            self._perchan_window.lift()
+            return
+
+        n = self.sweat_processor.n_channels
+
+        # Seed base values from the current global slider position.
+        global_val = float(self.sweat_slider.get())
+        self._perchan_base  = [global_val] * n
+        self._perchan_nudge = 0.0
+
+        # ----- Build the window -----
+        win = tk.Toplevel(self.root)
+        win.title("Per-channel Sweat")
+        win.configure(bg='#0f172a')
+        win.protocol("WM_DELETE_WINDOW", self._close_perchannel_window)
+        self._perchan_window = win
+
+        # Currently selected channel (for the diagram highlight).
+        self._perchan_selected = 0
+
+        # --- Forearm diagram canvas ---
+        # Schematic only, NOT anatomically precise. 8 electrode dots
+        # arranged in a ring to represent a circumferential armband
+        # (Myo-style). The selected electrode is highlighted.
+        canvas_w, canvas_h = 260, 260
+        self._perchan_canvas = tk.Canvas(
+            win, width=canvas_w, height=canvas_h,
+            bg='#0a1628', highlightthickness=0
+        )
+        self._perchan_canvas.grid(row=0, column=0, rowspan=n,
+                                  padx=12, pady=12, sticky='n')
+        self._perchan_electrode_ids = {}   # channel index -> canvas oval id
+        self._draw_forearm_diagram(canvas_w, canvas_h)
+
+        # --- Per-channel sliders ---
+        self._perchan_sliders = []
+        self._perchan_labels  = []
+        for ch in range(n):
+            row_frame = tk.Frame(win, bg='#0f172a')
+            row_frame.grid(row=ch, column=1, sticky='w', padx=(0, 12), pady=1)
+
+            lbl = tk.Label(
+                row_frame, text=f"Ch{ch+1}: 0%",
+                bg='#0f172a', fg='#a78bfa',
+                font=('Courier', 9, 'bold'), width=9, anchor='w'
+            )
+            lbl.pack(side='left', padx=(0, 6))
+            self._perchan_labels.append(lbl)
+
+            sld = tk.Scale(
+                row_frame, from_=0.0, to=1.0, resolution=0.01,
+                orient='horizontal', length=160, showvalue=False,
+                command=lambda v, c=ch: self._on_perchan_slider(c, v),
+                bg='#1e293b', fg='#a78bfa',
+                troughcolor='#0a1628', activebackground='#263d5e',
+                highlightthickness=0, relief='flat', sliderrelief='flat',
+                cursor='hand2'
+            )
+            sld.set(self._perchan_base[ch])
+            sld.pack(side='left')
+            # Click on a slider selects that channel in the diagram.
+            sld.bind("<Button-1>", lambda e, c=ch: self._select_perchan(c))
+            self._perchan_sliders.append(sld)
+
+        # --- Group nudge slider ---
+        nudge_frame = tk.LabelFrame(
+            win, text="  Group nudge  ",
+            bg='#0f172a', fg='#334155', font=('Helvetica', 9),
+            bd=1, relief='groove'
+        )
+        nudge_frame.grid(row=n, column=1, sticky='we', padx=(0, 12), pady=(8, 4))
+
+        self._perchan_nudge_label = tk.Label(
+            nudge_frame, text="Nudge: +0%",
+            bg='#0f172a', fg='#fbbf24',
+            font=('Courier', 9, 'bold'), width=11, anchor='w'
+        )
+        self._perchan_nudge_label.pack(side='left', padx=(6, 6), pady=4)
+
+        self._perchan_nudge_slider = tk.Scale(
+            nudge_frame, from_=-1.0, to=1.0, resolution=0.01,
+            orient='horizontal', length=150, showvalue=False,
+            command=self._on_perchan_nudge,
+            bg='#1e293b', fg='#fbbf24',
+            troughcolor='#0a1628', activebackground='#263d5e',
+            highlightthickness=0, relief='flat', sliderrelief='flat',
+            cursor='hand2'
+        )
+        self._perchan_nudge_slider.set(0.0)
+        self._perchan_nudge_slider.pack(side='left', padx=(0, 6), pady=4)
+
+        # --- Dry all button ---
+        dry_all = tk.Button(
+            win, text="Dry all",
+            command=self._perchan_dry_all,
+            bg='#1e293b', fg='#34d399',
+            activebackground='#263d5e', activeforeground='#34d399',
+            relief='flat', font=('Helvetica', 9, 'bold'),
+            cursor='hand2', padx=8, pady=3
+        )
+        dry_all.grid(row=n+1, column=1, sticky='e', padx=(0, 12), pady=(4, 12))
+
+        # Push the initial per-channel targets to the processor.
+        self._push_perchan_targets()
+        self._select_perchan(0)
+
+    def _draw_forearm_diagram(self, w, h):
+        """
+        Draw a schematic forearm with 8 electrode dots in a ring.
+        NOT anatomically precise; a circumferential armband schematic
+        so the user can reason about which channel is which. The
+        selected electrode is redrawn highlighted by _select_perchan.
+        """
+        c = self._perchan_canvas
+        c.delete("all")
+
+        # Forearm outline: a rounded vertical capsule.
+        margin = 40
+        c.create_oval(margin, 20, w - margin, h - 20,
+                      outline='#334155', width=2, fill='#111c30')
+
+        # 8 electrode dots arranged in a ring inside the outline.
+        import math
+        n = self.sweat_processor.n_channels
+        cx, cy = w / 2, h / 2
+        rx, ry = (w - 2 * margin) / 2 - 14, (h - 40) / 2 - 14
+        self._perchan_electrode_ids = {}
+        self._perchan_dot_coords = {}
+        for ch in range(n):
+            angle = -math.pi / 2 + 2 * math.pi * ch / n  # start at top, clockwise
+            ex = cx + rx * math.cos(angle)
+            ey = cy + ry * math.sin(angle)
+            r = 12
+            oid = c.create_oval(ex - r, ey - r, ex + r, ey + r,
+                                fill='#1e293b', outline='#475569', width=2)
+            c.create_text(ex, ey, text=str(ch + 1),
+                          fill='#94a3b8', font=('Helvetica', 9, 'bold'))
+            self._perchan_electrode_ids[ch] = oid
+            self._perchan_dot_coords[ch] = (ex, ey, r)
+            # Clicking a dot selects that channel.
+            c.tag_bind(oid, "<Button-1>",
+                       lambda e, cc=ch: self._select_perchan(cc))
+
+    def _select_perchan(self, ch):
+        """Highlight the selected electrode on the diagram and its slider."""
+        self._perchan_selected = ch
+        c = self._perchan_canvas
+
+        # Redraw all dots at base color, then highlight the selected one.
+        for i, oid in self._perchan_electrode_ids.items():
+            # Fill intensity scales with that channel's current base level.
+            level = self._perchan_base[i]
+            # Interpolate dot fill from dry (dark) to wet (purple).
+            shade = int(30 + level * 120)
+            fill = f'#{shade:02x}1e{min(255, 60 + int(level*180)):02x}'
+            c.itemconfig(oid, fill=fill, outline='#475569', width=2)
+
+        # Highlight selected with a bright ring.
+        sel_oid = self._perchan_electrode_ids[ch]
+        c.itemconfig(sel_oid, outline='#a78bfa', width=3)
+
+        # Highlight the selected slider's label.
+        for i, lbl in enumerate(self._perchan_labels):
+            lbl.config(fg='#fbbf24' if i == ch else '#a78bfa')
+
+    def _on_perchan_slider(self, ch, value_str):
+        """A per-channel base slider moved."""
+        self._perchan_base[ch] = float(value_str)
+        self._push_perchan_targets()
+        self._select_perchan(ch)  # re-highlight and refresh dot shades
+
+    def _on_perchan_nudge(self, value_str):
+        """The group nudge slider moved."""
+        self._perchan_nudge = float(value_str)
+        pct = int(round(self._perchan_nudge * 100))
+        sign = '+' if pct >= 0 else ''
+        self._perchan_nudge_label.config(text=f"Nudge: {sign}{pct}%")
+        self._push_perchan_targets()
+
+    def _push_perchan_targets(self):
+        """
+        Compute effective per-channel targets (base + nudge, clipped)
+        and send them to the processor. Also refresh the per-channel
+        labels to show the effective value.
+        """
+        import numpy as np
+        base  = np.asarray(self._perchan_base, dtype=float)
+        eff   = np.clip(base + self._perchan_nudge, 0.0, 1.0)
+        self.sweat_processor.set_channel_sweat_levels(eff)
+
+        for ch, lbl in enumerate(self._perchan_labels):
+            pct = int(round(eff[ch] * 100))
+            lbl.config(text=f"Ch{ch+1}: {pct}%")
+
+    def _perchan_dry_all(self):
+        """Zero all base sliders and the nudge."""
+        for sld in self._perchan_sliders:
+            sld.set(0.0)   # fires _on_perchan_slider for each
+        self._perchan_nudge_slider.set(0.0)  # fires _on_perchan_nudge
+
+    def _close_perchannel_window(self):
+        """
+        Close the per-channel window and hand control back to the global
+        slider. Per the design decision, all channels reset to the global
+        slider's current position.
+        """
+        if self._perchan_window is not None:
+            self._perchan_window.destroy()
+            self._perchan_window = None
+
+        # Reset processor to uniform global-slider level.
+        global_val = float(self.sweat_slider.get())
+        self.sweat_processor.set_sweat_level(global_val)
 
 
 
@@ -2146,6 +2399,10 @@ class EMGSimulatorApp:
             bg=t['btn_bg'],
             activebackground=t['btn_active_bg'],
         )
+        self.sweat_perchan_btn.configure(
+            bg=t['btn_bg'],
+            activebackground=t['btn_active_bg'],
+        )
         
         if hasattr(self, 'anim'):
             try:
@@ -2408,7 +2665,9 @@ class EMGSimulatorApp:
                 # Log the error but don't kill the thread. The next iteration
                 # will try again. A persistent error will spam the console
                 # which is the signal to investigate.
+                import traceback
                 print(f"[EMGDataThread] error: {type(e).__name__}: {e}")
+                traceback.print_exc()
 
             # Recalculate interval each cycle so rate changes take effect immediately
             batch_interval     = BATCH_SIZE / self.fs
@@ -2486,15 +2745,17 @@ class EMGSimulatorApp:
 # =============================================================================
 
 def main():
+    import argparse
+    parser = argparse.ArgumentParser(description='EMG simulator with artifact pipeline.')
+    parser.add_argument('--sweat-steepness', type=float, default=8.0,
+                        help='Sigmoid steepness for sweat amplitude attenuation. '
+                             '2.0 is near-linear; 8.0 (default) has mild tail saturation; '
+                             '15+ is sharply S-shaped.')
+    args = parser.parse_args()
+
     root = tk.Tk()
-    app  = EMGSimulatorApp(root)
-
-    # Register the close handler
-    root.protocol("WM_DELETE_WINDOW", app.on_close)
-
-    # Start the Tkinter event loop (blocks here until window is closed)
+    app = EMGSimulatorApp(root, sweat_steepness=args.sweat_steepness)
     root.mainloop()
-
 
 if __name__ == '__main__':
     main()
