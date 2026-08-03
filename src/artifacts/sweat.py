@@ -321,13 +321,15 @@ class SweatProcessor(BaseArtifact):
             self._drift_b, self._drift_a, noise, axis=0, zi=self._drift_noise_zi
         )
 
-        # Step 3: scale by per-channel sweat and signal RMS, then add to signal.
-        # drift_trace already has std around 0.03 from the lowpass alone. The
-        # scale factor needs to bring this up to something visible relative to
-        # signal RMS. We boost by a fixed factor that makes drift comparable to
-        # (not larger than) signal amplitude at full sweat.
-        drift_amplitude = self.drift_scale * s * self._running_rms * 30.0  # shape (C,)
-        out = out + drift_trace * drift_amplitude
+        # Step 3: normalize drift to unit std via the filter's precomputed
+        # noise gain, then scale by per-channel sweat and signal RMS.
+        # Dividing by a fixed per-fs constant (not each buffer's own std)
+        # makes drift both fs-independent AND continuous across streaming
+        # buffers. drift_scale is now directly interpretable: the drift
+        # std as a fraction of signal RMS at full sweat.
+        drift_unit      = drift_trace / self._drift_noise_gain          # ~unit std
+        drift_amplitude = self.drift_scale * s * self._running_rms      # shape (C,)
+        out = out + drift_unit * drift_amplitude
         #
         
         
@@ -448,12 +450,35 @@ class SweatProcessor(BaseArtifact):
         self._running_rms = np.sqrt(ms_smoothed)
 
     def _design_drift_noise_filter(self) -> None:
-        """..."""
+        """
+        Design the sub-1-Hz lowpass that turns white noise into slow
+        baseline drift, and precompute the filter's noise gain.
+
+        Noise gain is the std of the filter output for unit-variance
+        white-noise input, computed from the impulse response. We divide
+        the drift trace by this constant so drift amplitude is set by
+        drift_scale alone, independent of fs. The raw filter output std
+        depends on fs (the fixed 0.5 Hz cutoff sits at a different
+        fraction of Nyquist at each rate), which is what made the old
+        fixed * 30.0 scaling explode at high sample rates. Using a
+        precomputed constant (not each buffer's own std) also keeps the
+        drift continuous across streaming buffers.
+        """
         nyq    = 0.5 * self.fs
         cutoff = min(0.5, 0.45 * nyq)               # clamp for tiny fs
         self._drift_b, self._drift_a = dsp.butter(
             N=2, Wn=cutoff / nyq, btype='low'
         )
+
+        # Noise gain = sqrt(sum of squared impulse response) = output std
+        # for unit-variance white-noise input. Long impulse for a stable
+        # estimate (the 0.5 Hz filter has a long tail).
+        imp = np.zeros(16384)
+        imp[0] = 1.0
+        h = dsp.lfilter(self._drift_b, self._drift_a, imp)
+        self._drift_noise_gain = float(np.sqrt(np.sum(h ** 2)))
+        if self._drift_noise_gain < 1e-12:
+            self._drift_noise_gain = 1.0
     
     def _get_lowpass_coeffs_for_channel(self, s_channel: float):
         """
