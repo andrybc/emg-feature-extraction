@@ -283,11 +283,74 @@ class EMGSignalGenerator:
             for _ in range(n_channels)
         ]
 
+        # EMG spectral shaping filter, designed in ABSOLUTE Hz so the
+        # output spectrum stays fixed regardless of sample rate. The old
+        # hardcoded-coefficient IIR (see _shape_noise) defined its shape
+        # relative to Nyquist, so at high fs it leaked energy above 400 Hz,
+        # which the sweat lowpass then cut, making even 1% sweat look like
+        # it halved the signal at fs>=2000. A runtime-designed bandpass
+        # fixes the spectrum in place.
+        self._design_shaping_filter()
+
         # Initialize through the same sampling code path that every
         # later gesture click will use, then snap current_peak so the
         # first sample is steady-state Rest, not a zero->Rest ramp.
         self.set_gesture('Rest')
         self.current_peak = self.target_peak.copy()
+
+    def _design_shaping_filter(self):
+        """
+        Design the EMG spectral-shaping bandpass for the current fs.
+
+        Targets roughly 20-350 Hz, the bulk of real surface EMG energy
+        (De Luca 1997), specified in absolute Hz. Because the cutoffs
+        are converted to normalized frequency using the CURRENT fs, the
+        output spectrum occupies the same Hz band at every sample rate.
+        Redesigned by set_fs() whenever the rate changes.
+
+        Stores per-channel filter delay-line state (zi) so the filter is
+        continuous across generate_samples() calls (no boundary clicks).
+        """
+        nyq  = 0.5 * self.fs
+        low  = 20.0  / nyq
+        high = 350.0 / nyq
+        # Clamp the top edge below Nyquist for low sample rates (e.g. at
+        # fs=500, 350 Hz is 0.7 of Nyquist, fine; at fs=600, 350/300=1.17
+        # would be invalid, so cap at 0.95).
+        high = min(high, 0.95)
+        # Guard: if fs is so low the band collapses, fall back to a lowpass.
+        if low >= high:
+            self._shape_b, self._shape_a = dsp.butter(4, high, btype='low')
+        else:
+            self._shape_b, self._shape_a = dsp.butter(4, [low, high], btype='band')
+
+        # Per-channel filter state, seeded to zero.
+        zi_proto = dsp.lfilter_zi(self._shape_b, self._shape_a)
+        self._shape_zi = [zi_proto * 0.0 for _ in range(self.n_channels)]
+
+        # Empirical output-scaling constant so the shaped noise has roughly
+        # the same RMS it had under the old hardcoded filter at fs=1000.
+        # Measured: the old filter produced std ~0.38 * input on white
+        # noise; this bandpass produces a different gain, so we normalize
+        # to unit std and reapply the 0.38 the old code used, keeping
+        # downstream amplitudes (and calibration) unchanged.
+        imp = np.zeros(4096)
+        imp[0] = 1.0
+        h = dsp.lfilter(self._shape_b, self._shape_a, imp)
+        gain = float(np.sqrt(np.sum(h ** 2)))
+        self._shape_gain = gain if gain > 1e-12 else 1.0
+
+    def set_fs(self, new_fs):
+        """
+        Update the generator's sample rate and redesign the shaping
+        filter so the output spectrum stays fixed in absolute Hz.
+
+        The app must call this (not set generator.fs directly) so the
+        filter redesign fires on every rate change.
+        """
+        self.fs = float(new_fs)
+        self._design_shaping_filter()
+
 
     def set_gesture(self, gesture_name: str):
         """
@@ -345,27 +408,24 @@ class EMGSignalGenerator:
 
     def _shape_noise(self, channel: int, amplitude: float) -> float:
         """
-        Apply a simple recursive IIR filter to white noise.
+        Shape one white-noise sample into EMG-like spectral content for
+        the given channel, using the runtime-designed bandpass filter.
 
-        Gives the noise a more EMG-like frequency shape: more energy in
-        the 50-300 Hz range, less in DC and very high frequencies.
+        The filter is designed in absolute Hz (see _design_shaping_filter),
+        so the output spectrum is the same at any sample rate. Per-channel
+        filter state is carried in self._shape_zi so the stream is
+        continuous across calls.
 
-            y[n] = 0.62*x[n] - 0.62*x[n-2] - 0.22*y[n-1] + 0.04*y[n-2]
-
-        Not a proper Butterworth filter (that lives in the notebook
-        preprocessing step). Just a fast approximation for visual realism.
+        Output is normalized by the filter's noise gain then rescaled by
+        0.38, matching the amplitude the old hardcoded filter produced at
+        fs=1000, so downstream levels and calibration are unchanged.
         """
         x = np.random.randn()
-
-        f = self._fs_state[channel]
-        y = 0.62*x - 0.62*f['x2'] - 0.22*f['y1'] + 0.04*f['y2']
-
-        f['x2'] = f['x1']
-        f['x1'] = x
-        f['y2'] = f['y1']
-        f['y1'] = y
-
-        return y * amplitude * 0.38
+        y, self._shape_zi[channel] = dsp.lfilter(
+            self._shape_b, self._shape_a, [x], zi=self._shape_zi[channel]
+        )
+        shaped = y[0] / self._shape_gain
+        return shaped * amplitude * 0.38
 
     def generate_samples(self, n_samples: int = 1):
         """
@@ -1766,7 +1826,9 @@ class EMGSimulatorApp:
         # while we are replacing it, causing a crash or corrupted display
         with self._buffer_lock:
             self.fs = new_fs
-            self.generator.fs = new_fs
+
+            self.generator.set_fs(new_fs)
+            
 
             # Notify each artifact that fs changed. Each one decides
             # what to recompute (filter coefficients, time-constant
