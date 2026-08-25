@@ -7,7 +7,9 @@ Implements BaseArtifact for use in the simulator's artifact pipeline.
 
 Models four physical mechanisms by which sweat degrades sEMG recordings:
     1. Amplitude attenuation       (Abdoli-Eramaki et al. 2012)
-    2. Low-pass filtering          (De Luca 1997; Abdoli-Eramaki et al. 2012)
+    2. Low-pass filtering          (De Luca 1997, asserted; speculative --
+       see notes/sweat_model_provenance.md. Abdoli-Eramaki 2012 found NO
+       mean-frequency change under sweat, so this mechanism is optional.)
     3. Baseline drift              (De Luca et al. 2010)
     4. CMRR loss from impedance    (Webster 1984; Xu et al. 2020)
        imbalance -> powerline pickup
@@ -48,8 +50,14 @@ class SweatProcessor(BaseArtifact):
     dry_cutoff_hz : float, default 400.0
         Low-pass cutoff at sweat_level = 0. Effectively no filtering.
     wet_cutoff_hz : float, default 150.0
-        Low-pass cutoff at sweat_level = 1. Matches mean-frequency drop
-        reported in Abdoli-Eramaki et al. 2012.
+        Low-pass cutoff at sweat_level = 1. A modeling choice, not a
+        measured value. De Luca 1997 asserts sweat "may filter out the
+        higher frequency components," but Abdoli-Eramaki 2012 tested for
+        a mean-frequency change and found none. See enable_lowpass.
+    enable_lowpass : bool, default True
+        Whether to apply Mechanism 2 (sweat low-pass). Speculative: De Luca
+        1997 asserts it, Abdoli-Eramaki 2012 found no spectral effect. Set
+        False to disable until validated against real sweaty recordings.
     max_attenuation : float, default 0.30
         Fractional amplitude loss at sweat_level = 1.
     drift_scale : float, default 0.5
@@ -71,6 +79,7 @@ class SweatProcessor(BaseArtifact):
             seed: int | None = None,
             dry_cutoff_hz: float = 400.0,
             wet_cutoff_hz: float = 150.0,
+            enable_lowpass: bool = True,
             max_attenuation: float = 0.30,
             drift_scale: float = 0.5,
             imbalance_range: tuple[float, float] = (0.0, 0.3),
@@ -84,6 +93,11 @@ class SweatProcessor(BaseArtifact):
             self.tau_sweat        = float(tau_sweat)
             self.dry_cutoff_hz    = float(dry_cutoff_hz)
             self.wet_cutoff_hz    = float(wet_cutoff_hz)
+            # Mechanism 2 (low-pass) is the least empirically supported of
+            # the four (De Luca 1997 asserts it; Abdoli-Eramaki 2012 found
+            # no MF change). Optional so it can be switched off until real
+            # sweaty recordings settle the question. See provenance doc.
+            self.enable_lowpass   = bool(enable_lowpass)
             self.max_attenuation  = float(max_attenuation)
             self.drift_scale      = float(drift_scale)
             self.rms_tau          = float(rms_tau)
@@ -263,44 +277,46 @@ class SweatProcessor(BaseArtifact):
         out = emg  # placeholder; will be reassigned by mechanisms below
 
         # --- Mechanism 1: amplitude attenuation (Abdoli-Eramaki et al. 2012) ---
-        # Sigmoid amplitude loss vs per-channel sweat level. Real EMG
-        # amplitude vs sweat shows a flat-then-drop-then-plateau shape
-        # rather than a straight-line drop; the sigmoid captures that.
-        # Normalized so the multiplier equals 1.0 at s=0 (preserving the
-        # pass-through guard) and (1 - max_attenuation) at s=1.
+        # Sigmoid amplitude loss vs per-channel sweat level. Abdoli-Eramaki
+        # 2012 and Ray & Guha 1983 measure a roughly LINEAR amplitude drop
+        # with sweat; the sigmoid is a modeling choice (bounded saturation
+        # so amplitude never goes negative), not a fit to their data. See
+        # notes/sweat_model_provenance.md. Normalized so the multiplier is
+        # 1.0 at s=0 (preserving the pass-through guard) and
+        # (1 - max_attenuation) at s=1.
         sigmoid_raw            = 1.0 / (1.0 + np.exp(-self._sigmoid_k * (s - 0.5)))   # shape (C,)
         sigmoid_normalized     = (sigmoid_raw - self._sig_at_zero) / self._sig_range  # shape (C,)
         attenuation_multiplier = 1.0 - self.max_attenuation * sigmoid_normalized      # shape (C,)
         out = emg * attenuation_multiplier                                            # shape (T, C)                   
 
 
-        # --- Mechanism 2: stateful low-pass filtering (De Luca 1997; ---
-        # --- Abdoli-Eramaki et al. 2012) ---
-        # Cutoff slides from dry_cutoff_hz (dry, near-transparent) down to
-        # wet_cutoff_hz (wet, attenuates the upper EMG band). PER-CHANNEL
-        # cutoff after Stage 3A: each channel's cutoff is driven by its
-        # own interface state, so clean channels see near-transparent
-        # filtering while sweaty channels see aggressive filtering.
+        # --- Mechanism 2: stateful low-pass filtering (SPECULATIVE, optional) ---
+        # De Luca 1997 (p. 142) asserts sweat "may filter out the higher
+        # frequency components" via electrical shunting. Abdoli-Eramaki 2012
+        # tested for a mean-frequency change under sweat and found NONE, even
+        # under the extreme wet condition. This mechanism is therefore the
+        # least empirically supported of the four and is gated behind
+        # enable_lowpass so it can be disabled until real sweaty recordings
+        # settle the question. See notes/sweat_model_provenance.md.
         #
-        # Filter state is preserved per-channel across buffers via
-        # lfilter_zi so there are no boundary discontinuities. Coefficient
-        # design is cached in _lp_cache keyed by quantized cutoff, so
-        # channels sharing (quantized) sweat level share designs.
-        filtered = np.empty_like(out)
-        for ch in range(self.n_channels):
-            b_ch, a_ch = self._get_lowpass_coeffs_for_channel(s[ch])
-
-            if self._lp_zi_per_channel[ch] is None:
-                # First call: seed filter state to steady state for this
-                # channel's first sample.
-                zi_single = dsp.lfilter_zi(b_ch, a_ch)              # shape (4,)
-                self._lp_zi_per_channel[ch] = zi_single * out[0, ch]  # shape (4,)
-
-            filtered[:, ch], self._lp_zi_per_channel[ch] = dsp.lfilter(
-                b_ch, a_ch, out[:, ch], zi=self._lp_zi_per_channel[ch]
-            )
-
-        out = filtered
+        # Cutoff slides from dry_cutoff_hz (dry, near-transparent) down to
+        # wet_cutoff_hz (wet). PER-CHANNEL cutoff after Stage 3A: each
+        # channel's cutoff is driven by its own interface state. Filter
+        # state is preserved per-channel via lfilter_zi; coefficient design
+        # is cached in _lp_cache keyed by quantized cutoff.
+        if self.enable_lowpass:
+            filtered = np.empty_like(out)
+            for ch in range(self.n_channels):
+                b_ch, a_ch = self._get_lowpass_coeffs_for_channel(s[ch])
+                if self._lp_zi_per_channel[ch] is None:
+                    # First call: seed filter state to steady state for this
+                    # channel's first sample.
+                    zi_single = dsp.lfilter_zi(b_ch, a_ch)              # shape (4,)
+                    self._lp_zi_per_channel[ch] = zi_single * out[0, ch]  # shape (4,)
+                filtered[:, ch], self._lp_zi_per_channel[ch] = dsp.lfilter(
+                    b_ch, a_ch, out[:, ch], zi=self._lp_zi_per_channel[ch]
+                )
+            out = filtered
 
 
         # --- Mechanism 3: baseline drift (De Luca et al. 2010) ---
