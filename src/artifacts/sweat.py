@@ -327,14 +327,24 @@ class SweatProcessor(BaseArtifact):
 
         # Step 1: white Gaussian noise per emg.
         noise = self._rng.standard_normal(size=(n_samples, self.n_channels))
-
-        # Step 2: low-pass filter to sub-1-Hz content. State preserved across emgs.
+        
+        # Step 2: low-pass filter to sub-1-Hz content. State preserved across
+        # buffers. Uses second-order-sections (SOS) form: at high fs the 0.5 Hz
+        # cutoff sits at a tiny fraction of Nyquist, where transfer-function
+        # (b, a) coefficients become numerically ill-conditioned and the
+        # realized output std drifts from the theoretical noise gain (observed
+        # ~0.89 vs 1.0 at fs=4000). SOS is a well-conditioned cascade that keeps
+        # the filter accurate at all sample rates, making the drift genuinely
+        # fs-invariant.
         if self._drift_noise_zi is None:
-            zi_single = dsp.lfilter_zi(self._drift_b, self._drift_a)  # shape (2,)
-            self._drift_noise_zi = np.zeros((len(zi_single), self.n_channels))
-
-        drift_trace, self._drift_noise_zi = dsp.lfilter(
-            self._drift_b, self._drift_a, noise, axis=0, zi=self._drift_noise_zi
+            # sosfilt_zi returns (n_sections, 2); broadcast across channels to
+            # (n_sections, 2, n_channels) for axis=0 filtering.
+            zi_proto = dsp.sosfilt_zi(self._drift_sos)                  # (n_sec, 2)
+            self._drift_noise_zi = (
+                zi_proto[:, :, None] * np.zeros((1, 1, self.n_channels))
+            )
+        drift_trace, self._drift_noise_zi = dsp.sosfilt(
+            self._drift_sos, noise, axis=0, zi=self._drift_noise_zi
         )
 
         # Step 3: normalize drift to unit std via the filter's precomputed
@@ -482,19 +492,31 @@ class SweatProcessor(BaseArtifact):
         """
         nyq    = 0.5 * self.fs
         cutoff = min(0.5, 0.45 * nyq)               # clamp for tiny fs
-        self._drift_b, self._drift_a = dsp.butter(
-            N=2, Wn=cutoff / nyq, btype='low'
+        # SOS (second-order-sections) form instead of transfer-function
+        # (b, a). At high fs the 0.5 Hz cutoff is a tiny fraction of Nyquist,
+        # where (b, a) coefficients are numerically ill-conditioned and the
+        # realized output std diverges from the theoretical noise gain
+        # (~0.89 vs 1.0 at fs=4000). SOS is a well-conditioned cascade that
+        # keeps the drift genuinely fs-invariant.
+        self._drift_sos = dsp.butter(
+            N=2, Wn=cutoff / nyq, btype='low', output='sos'
         )
-
-        # Noise gain = sqrt(sum of squared impulse response) = output std
-        # for unit-variance white-noise input. Long impulse for a stable
-        # estimate (the 0.5 Hz filter has a long tail).
-        imp = np.zeros(16384)
-        imp[0] = 1.0
-        h = dsp.lfilter(self._drift_b, self._drift_a, imp)
-        self._drift_noise_gain = float(np.sqrt(np.sum(h ** 2)))
-        if self._drift_noise_gain < 1e-12:
-            self._drift_noise_gain = 1.0
+        # Noise gain = std of the filter output for unit-variance white-noise
+        # input. Measured empirically from a long white-noise run scaled to the
+        # sample rate, NOT from a fixed-length impulse response. At high fs the
+        # 0.5 Hz cutoff is so slow that a fixed 16384-sample impulse truncates
+        # the tail and mis-estimates the gain (observed ~8% error at fs=4000,
+        # giving drift_unit std 0.89 instead of 1.0). A run of fixed DURATION
+        # (60 s) captures the true steady-state output std at every fs, making
+        # drift_unit genuinely unit-std and the drift fs-invariant. Seeded with
+        # its own RNG so the gain is deterministic and does not perturb the
+        # processor's main RNG stream.
+        gain_rng = np.random.default_rng(0)
+        n_gain   = max(16384, int(self.fs * 60.0))   # >= 60 s of samples
+        white    = gain_rng.standard_normal(n_gain)
+        h        = dsp.sosfilt(self._drift_sos, white)
+        skip     = int(self.fs * 5.0)                # discard 5 s settling
+        self._drift_noise_gain = float(np.std(h[skip:]))
     
     def _get_lowpass_coeffs_for_channel(self, s_channel: float):
         """
