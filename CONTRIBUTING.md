@@ -165,6 +165,44 @@ PYTHONPATH=. python scratch_test_<your-name>.py
 
 If any assertion fails, fix the class before going further. Debugging a `BaseArtifact` subclass on its own is much easier than debugging it through a Tkinter event loop in a background data thread.
 
+## Running the automated test suite
+
+The repo has an automated pytest suite under `tests/` covering the sweat
+processor and the signal generator (sigmoid attenuation, sample-rate
+amplitude invariance, powerline harmonics, per-channel isolation, and
+generator spectrum). Run it with the wrapper script:
+
+```bash
+./run_tests.sh
+```
+
+Run a single file or a single test:
+
+```bash
+./run_tests.sh tests/test_sigmoid.py -v
+./run_tests.sh tests/test_fs_stability.py::test_low_sweat_amplitude_near_unity -v
+```
+
+### Why the wrapper instead of plain `pytest`
+
+`run_tests.sh` sets `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1`. If you have ROS 2
+sourced in your shell (a `source /opt/ros/.../setup.bash` line in your
+shell profile), ROS exposes pytest plugins (`launch_testing`,
+`launch_pytest`) through `PYTHONPATH`. Pytest auto-loads them and
+collection crashes with errors like `unknown hook
+pytest_launch_collect_makemodule` or `ModuleNotFoundError: No module
+named 'lark'`. Disabling plugin autoload sidesteps this; the project's
+tests need no external pytest plugins.
+
+On a machine without ROS sourced, plain `pytest` also works. If you keep
+hitting ROS-related collection errors elsewhere, the cleaner long-term
+fix is to source ROS only in the shells where you do robotics work,
+rather than globally.
+
+When you add an artifact, add a test module under `tests/` following the
+existing pattern: assertions with defined numerical tolerances, and a
+short comment explaining where each tolerance comes from.
+
 ## Wire it into the simulator
 
 Three edits.

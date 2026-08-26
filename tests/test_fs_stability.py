@@ -6,12 +6,17 @@ measured across fs = 1000/2000/4000 on EMG-representative generator
 output. The spread (max - min, relative to max) must stay within a
 per-level tolerance.
 
+Reproducibility: the generator's internal noise draws from NumPy's global
+RNG, so np.random.seed(12345) is set before each measurement to make the
+spreads identical run to run.
+
 Tolerance rationale (see notes/sweat_model_provenance.md):
-Invariance is tight at low-to-mid sweat and widens at full sweat because
-the running-RMS estimator is not perfectly scale-invariant, so the
-additive drift and powerline terms (strongest at full sweat) leave a
-small fs-dependence. Tolerances are the measured spread plus ~1.5-2
-points of margin to absorb seed/platform variation without flaking.
+Invariance is tight at low-to-mid sweat (3-4%) and widens at full sweat
+(~9%). The full-sweat residual decomposes into ~2.6% from the generator's
+high-frequency tail through the wet low-pass, plus drift-mechanism spread
+that is largely short-window estimation noise on a 0.5 Hz process. Both
+are documented floors, not defects. Tolerances are the measured spread
+plus ~2 points of margin to absorb seed/platform variation.
 """
 
 import numpy as np
@@ -20,7 +25,6 @@ import pytest
 
 from src.artifacts.sweat import SweatProcessor
 
-# Load the generator from the simulator module.
 _spec = importlib.util.spec_from_file_location("emg_simulator", "emg_simulator.py")
 _mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_mod)
@@ -28,24 +32,23 @@ EMGSignalGenerator = _mod.EMGSignalGenerator
 
 RATES = [1000.0, 2000.0, 4000.0]
 
-# (sweat_level, tolerance_fraction) from measured spreads plus margin.
+# (sweat_level, tolerance_fraction) from measured reproducible spreads
+# (generator seeded) plus ~2 points of margin.
 LEVEL_TOLERANCE = [
     (0.01, 0.05),
     (0.10, 0.05),
-    (0.25, 0.05),
+    (0.25, 0.06),
     (0.50, 0.05),
     (0.75, 0.08),
-    (1.00, 0.13),
+    (1.00, 0.12),
 ]
 
 
 def amplitude_ratio(fs, sweat_level, seconds=4.0):
     """Ratio of output RMS to input RMS at one fs and sweat level.
 
-    Seeds NumPy's global RNG so the generator's internal randn() calls
-    are deterministic and the measurement is reproducible run to run.
-    The generator itself does not take a seed, so we set the global
-    state here.
+    Seeds NumPy's global RNG so the generator's internal noise is
+    deterministic and the measurement is reproducible run to run.
     """
     np.random.seed(12345)
     gen = EMGSignalGenerator(fs=fs)
