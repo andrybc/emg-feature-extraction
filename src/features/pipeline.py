@@ -257,3 +257,78 @@ def extract_features_both(signal, window_size, step_size,
     feature_names = names_a_prefixed + names_b_prefixed
 
     return feature_matrix, feature_names
+
+
+# ---------------------------------------------------------------------
+# CAPSAS FIVE-FEATURE SET (Overton et al. 2026 / LIMB CAPSAS analysis)
+# ---------------------------------------------------------------------
+# The lab's CAPSAS window-sweep uses five time-domain features per
+# channel: MAV, population variance, waveform length, zero crossings,
+# and slope-sign changes. For 8 channels that is 5 * 8 = 40 features,
+# matching the "40 total" in the CAPSAS methods.
+#
+# Distinct from Path A (Hudgins), which is the classic FOUR feature set.
+# Kept separate so each name stays accurate: Path A is the literature
+# baseline; this is the lab's operational set.
+#
+# "Population variance" means variance with ddof=0 (divide by N), which
+# is what the slide specifies, NOT the sample variance (ddof=1).
+
+def extract_features_capsas(signal, window_size, step_size,
+                            zc_threshold=1e-5,
+                            ssc_threshold=1e-5,
+                            channel_names=None):
+    """
+    Extract the CAPSAS five-feature set per channel:
+    MAV, population variance (ddof=0), WL, ZC, SSC.
+
+    For an 8-channel signal this gives 5 * 8 = 40 features per window.
+
+    Parameters
+    ----------
+    signal : np.ndarray of shape (n_samples, n_channels)
+    window_size : int, samples per window
+    step_size : int, samples between window starts
+    zc_threshold : float, noise threshold for zero crossings
+    ssc_threshold : float, noise threshold for slope sign changes
+    channel_names : list of str, optional
+        Original channel column names for output naming.
+
+    Returns
+    -------
+    feature_matrix : np.ndarray of shape (n_windows, 5 * n_channels)
+    feature_names : list of str
+    """
+    windows = window_signal(signal, window_size, step_size)
+    n_windows = windows.shape[0]
+    n_channels = windows.shape[2]
+
+    n_features_per_channel = 5
+    feature_matrix = np.empty((n_windows, n_features_per_channel * n_channels))
+
+    for w_idx in range(n_windows):
+        window = windows[w_idx]  # (window_size, n_channels)
+
+        f_mav = mav(window)
+        # Population variance: ddof=0 (divide by N), per the CAPSAS methods.
+        f_var = np.var(window, axis=0, ddof=0)
+        f_wl = waveform_length(window)
+        f_zc = zero_crossings(window, threshold=zc_threshold)
+        f_ssc = slope_sign_changes(window, threshold=ssc_threshold)
+
+        # Order matches the slide: MAV, VAR, WL, ZC, SSC.
+        stacked = np.stack([f_mav, f_var, f_wl, f_zc, f_ssc], axis=1)
+        feature_matrix[w_idx] = stacked.flatten()
+
+    feature_names = []
+    for c in range(n_channels):
+        stem = channel_names[c] if channel_names is not None else f"ch{c}"
+        feature_names.extend([
+            f"{stem}_mav",
+            f"{stem}_var",
+            f"{stem}_wl",
+            f"{stem}_zc",
+            f"{stem}_ssc",
+        ])
+
+    return feature_matrix, feature_names
