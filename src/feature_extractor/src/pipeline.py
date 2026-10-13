@@ -157,59 +157,59 @@ def extract_features_path_b(signal, window_size, step_size,
     """
 
     # ----- ENABLE PATH B BY DELETING THE NEXT LINE -----
-    raise NotImplementedError(
-        "Path B is disabled. To enable it: open src/pipeline.py, delete "
-        "this raise statement, and uncomment the lines marked "
-        "'# UNCOMMENT FOR PATH B' below."
-    )
+    # raise NotImplementedError(
+    #     "Path B is disabled. To enable it: open src/pipeline.py, delete "
+    #     "this raise statement, and uncomment the lines marked "
+    #     "'# UNCOMMENT FOR PATH B' below."
+    # )
 
-    # # UNCOMMENT FOR PATH B
-    # # Step 1: chop into windows (same as Path A).
-    # windows = window_signal(signal, window_size, step_size)
-    # n_windows = windows.shape[0]
-    # n_channels = windows.shape[2]
-    #
-    # # UNCOMMENT FOR PATH B
-    # # Step 2: pre-allocate. 3 base features + ar_order AR coefficients per channel.
-    # n_features_per_channel = 3 + ar_order
-    # feature_matrix = np.empty((n_windows, n_features_per_channel * n_channels))
-    #
-    # # UNCOMMENT FOR PATH B
-    # # Step 3: loop and compute.
-    # for w_idx in range(n_windows):
-    #     window = windows[w_idx]
-    #
-    #     # Base features: shape (n_channels,) each.
-    #     f_mav = mav(window)
-    #     f_wl = waveform_length(window)
-    #     f_wamp = willison_amplitude(window, threshold=wamp_threshold)
-    #
-    #     # AR coefficients: shape (ar_order, n_channels).
-    #     # Each column is one channel's coefficient vector.
-    #     f_ar = ar_coefficients(window, order=ar_order)
-    #
-    #     # Stack everything into shape (n_channels, n_features_per_channel).
-    #     # We transpose f_ar so each ROW becomes one channel's AR coefficients.
-    #     base_stacked = np.stack([f_mav, f_wl, f_wamp], axis=1)  # (n_channels, 3)
-    #     ar_stacked = f_ar.T                                       # (n_channels, ar_order)
-    #     full_stacked = np.concatenate([base_stacked, ar_stacked], axis=1)
-    #
-    #     feature_matrix[w_idx] = full_stacked.flatten()
-    #
-    # # UNCOMMENT FOR PATH B
-    # # Step 4: column names. Use original channel names if provided
-    # # (same logic as Path A).
-    # feature_names = []
-    # for c in range(n_channels):
-    #     stem = channel_names[c] if channel_names is not None else f"ch{c}"
-    #     feature_names.append(f"{stem}_mav")
-    #     feature_names.append(f"{stem}_wl")
-    #     feature_names.append(f"{stem}_wamp")
-    #     for p in range(1, ar_order + 1):
-    #         feature_names.append(f"{stem}_ar{p}")
-    #
-    # # UNCOMMENT FOR PATH B
-    # return feature_matrix, feature_names
+    # UNCOMMENT FOR PATH B
+    # Step 1: chop into windows (same as Path A).
+    windows = window_signal(signal, window_size, step_size)
+    n_windows = windows.shape[0]
+    n_channels = windows.shape[2]
+    
+    # UNCOMMENT FOR PATH B
+    # Step 2: pre-allocate. 3 base features + ar_order AR coefficients per channel.
+    n_features_per_channel = 3 + ar_order
+    feature_matrix = np.empty((n_windows, n_features_per_channel * n_channels))
+    
+    # UNCOMMENT FOR PATH B
+    # Step 3: loop and compute.
+    for w_idx in range(n_windows):
+        window = windows[w_idx]
+    
+        # Base features: shape (n_channels,) each.
+        f_mav = mav(window)
+        f_wl = waveform_length(window)
+        f_wamp = willison_amplitude(window, threshold=wamp_threshold)
+    
+        # AR coefficients: shape (ar_order, n_channels).
+        # Each column is one channel's coefficient vector.
+        f_ar = ar_coefficients(window, order=ar_order)
+    
+        # Stack everything into shape (n_channels, n_features_per_channel).
+        # We transpose f_ar so each ROW becomes one channel's AR coefficients.
+        base_stacked = np.stack([f_mav, f_wl, f_wamp], axis=1)  # (n_channels, 3)
+        ar_stacked = f_ar.T                                       # (n_channels, ar_order)
+        full_stacked = np.concatenate([base_stacked, ar_stacked], axis=1)
+    
+        feature_matrix[w_idx] = full_stacked.flatten()
+    
+    # UNCOMMENT FOR PATH B
+    # Step 4: column names. Use original channel names if provided
+    # (same logic as Path A).
+    feature_names = []
+    for c in range(n_channels):
+        stem = channel_names[c] if channel_names is not None else f"ch{c}"
+        feature_names.append(f"{stem}_mav")
+        feature_names.append(f"{stem}_wl")
+        feature_names.append(f"{stem}_wamp")
+        for p in range(1, ar_order + 1):
+            feature_names.append(f"{stem}_ar{p}")
+    
+    # UNCOMMENT FOR PATH B
+    return feature_matrix, feature_names
 
 
 # ---------------------------------------------------------------------

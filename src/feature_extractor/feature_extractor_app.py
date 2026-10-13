@@ -169,7 +169,7 @@ class FeatureExtractorApp:
         ttk.Entry(thr_frame, textvariable=self.ssc_thr_var, width=10).grid(row=0, column=3, padx=(0, 20))
 
         ttk.Label(thr_frame, text="WAMP threshold:").grid(row=0, column=4, sticky=tk.W, padx=(0, 5))
-        self.wamp_thr_var = tk.StringVar(value="1e-5")
+        self.wamp_thr_var = tk.StringVar(value="5e-2")
         ttk.Entry(thr_frame, textvariable=self.wamp_thr_var, width=10).grid(row=0, column=5)
 
         # ===== Section 6: Action buttons =====

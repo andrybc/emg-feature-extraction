@@ -106,6 +106,25 @@ SCATTER_PAIRINGS_B = [
     ("ar1", "ar2"),
 ]
 
+# BOTH pairings mix Path A and Path B features so the user sees both
+# halves represented. Chosen to highlight cross-path relationships:
+#   - MAV vs WL: the universal classic, shared by both paths
+#   - ZC vs WAMP: Path A's frequency proxy vs Path B's frequency proxy.
+#     Phinyomark groups these together as "frequency information features"
+#     and showed they're redundant; the scatter should reveal a roughly
+#     linear/diagonal relationship.
+#   - MAV vs WAMP: Phinyomark's canonical "energy vs frequency" pairing,
+#     the strongest two features in his recommended set.
+#   - AR1 vs AR2: prediction-model coefficients from Path B, showing how
+#     temporal pattern features cluster by gesture (different shape from
+#     amplitude-based features).
+SCATTER_PAIRINGS_BOTH = [
+    ("mav", "wl"),
+    ("zc", "wamp"),
+    ("mav", "wamp"),
+    ("ar1", "ar2"),
+]
+
 # How many features each path produces per channel. Used for indexing.
 FEATURES_PER_CHANNEL = {
     "A": 4,    # MAV, WL, ZC, SSC
@@ -418,22 +437,47 @@ class FeatureVisualizerWindow:
         Build {(channel_idx, short_feature_name): column_idx}.
 
         feature_names look like 'ch1_mV_mav' (Path A or B alone) or
-        'A_ch1_mV_mav' (Both mode). The short name is always the last
-        underscore-separated segment.
+        'A_ch1_mV_mav' / 'B_ch1_mV_wamp' (BOTH mode). The short name is
+        always the last underscore-separated segment.
+
+        For BOTH mode we index BOTH halves so the visualizer can show
+        features from both paths. Path A is processed first, so when
+        BOTH paths share a feature (MAV, WL), the Path A column wins.
+        The values are mathematically identical anyway since the same
+        windows feed both extractors.
         """
         index = {}
 
         if path == "BOTH":
-            # Two halves: Path A columns first, Path B columns second.
-            # We index only the Path A side (which is what scatter pairings
-            # for "BOTH" mode use). Columns 0..(4*n_channels-1) are Path A.
-            for col_idx in range(4 * self.n_channels):
+            # Layout:
+            #   columns [0,                 n_a_total)     -> Path A
+            #   columns [n_a_total, n_a_total + n_b_total) -> Path B
+            n_a_per_channel = 4
+            n_b_per_channel = 7
+            n_a_total = n_a_per_channel * self.n_channels
+
+            # --- Path A side: index columns 0..n_a_total-1 ---
+            for col_idx in range(n_a_total):
                 name = feature_names[col_idx]
-                # Drop the 'A_' prefix.
+                # Drop the 'A_' prefix that extract_features_both adds.
                 stripped = name[2:] if name.startswith("A_") else name
                 short = stripped.rsplit("_", 1)[-1]
-                ch_idx = col_idx // 4   # 4 features per channel in Path A side
+                ch_idx = col_idx // n_a_per_channel
                 index[(ch_idx, short)] = col_idx
+
+            # --- Path B side: index columns n_a_total..end ---
+            # For features that ALSO exist in Path A (mav, wl), we skip
+            # rather than overwrite so the Path A column wins. This keeps
+            # column ordering predictable in the trajectory plot.
+            for col_idx in range(n_a_total, len(feature_names)):
+                name = feature_names[col_idx]
+                stripped = name[2:] if name.startswith("B_") else name
+                short = stripped.rsplit("_", 1)[-1]
+                # Offset relative to start of Path B half.
+                b_offset = col_idx - n_a_total
+                ch_idx = b_offset // n_b_per_channel
+                if (ch_idx, short) not in index:
+                    index[(ch_idx, short)] = col_idx
         else:
             for col_idx, name in enumerate(feature_names):
                 short = name.rsplit("_", 1)[-1]
@@ -611,15 +655,21 @@ class FeatureVisualizerWindow:
         ax.set_ylabel("Z-scored value", fontsize=9)
         ax.tick_params(labelsize=8)
         ax.grid(True, alpha=0.3)
-        ax.legend(loc="upper right", fontsize=8, ncol=len(self.traj_lines))
+        # Cap legend at 5 columns. BOTH mode has 9 lines which would
+        # otherwise produce an absurdly wide single-row legend.
+        ax.legend(loc="upper right", fontsize=8,
+                  ncol=min(5, len(self.traj_lines)))
 
     def _build_scatter_panels(self):
         """Bottom: 2x2 scatter grid with feature pairings, dots by gesture."""
         data = self._current_data
 
-        # Pick pairings based on path. BOTH uses Path A pairings (cleaner).
+        # Pick pairings based on path. Each path has its own set chosen
+        # to highlight that path's important relationships.
         if self.path == "B":
             pairings = SCATTER_PAIRINGS_B
+        elif self.path == "BOTH":
+            pairings = SCATTER_PAIRINGS_BOTH
         else:
             pairings = SCATTER_PAIRINGS_A
 
